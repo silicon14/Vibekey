@@ -246,6 +246,7 @@ cargo test -p vibekey-core
 
 ~~~
 Cargo.toml                  workspace（core + win 两个 crate）
+AGENTS.md                   开发/交接说明（在 Windows 上接手本项目时先读）
 crates/vibekey-core/        平台无关：配置 / 快捷键 / 模板展开 / 同步 / 状态 / 密码抽象
 crates/vibekey-win/         Win32 前端：托盘 / 键盘钩子 / 注入 / 列表 / 菜单 / 设置 / DPAPI / 同步线程
 scripts/
