@@ -182,6 +182,29 @@ static LAST_VK_DOWN: AtomicBool = AtomicBool::new(false);
 /// repeated Alt+<digit> system key messages.
 static CONSUMED_VK: AtomicU32 = AtomicU32::new(0);
 
+/// Debug builds can be told to accept synthetic input so that the smoke test
+/// script can drive the hook with SendInput. Release builds compile this away
+/// and always ignore injected input.
+#[cfg(debug_assertions)]
+fn accept_injected_input() -> bool {
+    static ACCEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ACCEPT.get_or_init(|| {
+        let enabled = std::env::var_os("VIBEKEY_TEST_INJECTED").is_some();
+        if enabled {
+            log::warn!(
+                "VIBEKEY_TEST_INJECTED is set: synthetic input can trigger hotkeys (debug build only)"
+            );
+        }
+        enabled
+    })
+}
+
+/// Release builds never accept synthetic input.
+#[cfg(not(debug_assertions))]
+fn accept_injected_input() -> bool {
+    false
+}
+
 /// Milliseconds since the process started.
 fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -241,7 +264,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     let keyboard = &*(lparam as *const KBDLLHOOKSTRUCT);
 
     // Our own injected input must never trigger a hotkey.
-    if keyboard.flags & LLKHF_INJECTED != 0 {
+    if keyboard.flags & LLKHF_INJECTED != 0 && !accept_injected_input() {
         return next();
     }
 

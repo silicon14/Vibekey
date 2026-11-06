@@ -11,8 +11,11 @@
   Alt+反引号打开片段列表，Alt+Backspace 打开配置菜单；配置是纯文本 TOML；支持 WebDAV 同步。
 - **当前状态**：功能已完整实现，源码在仓库里；core 有 37 个单元测试 + 9 个 WebDAV 集成测试全绿；
   Win7 x64/i686 的 exe 已用 Linux 交叉编译产出，PE 头/导入表已做静态校验。
-- **最大的缺口**：**从未在真实的 Windows 上运行过 GUI**。键盘钩子、托盘、弹窗焦点、剪贴板、菜单模式等
-  只能靠代码审查与编译静态校验，**真机冒烟测试是接手后的第一优先级**。
+- **真机验证进度**（2026-11-06，Windows 11 26200 x64）：已确认启动 / 托盘图标 / 右键菜单 /
+  双击设置窗口 / 单实例 / 退出 / 真键盘 Alt+1 插入全部正常，记录见 `docs/testing-win11-2026-11-06.md`。
+  仍待验证：Alt+反引号列表、hold 模式、剪贴板恢复、管理员权限窗口、多显示器 DPI、Win7、中文输入法下插入。
+- **Windows 本机构建已跑通**（2026-11-06）：rustup stable 1.99.1 MSVC + VS Build Tools 18 + SDK 10.0.26100；
+  `cargo test -p vibekey-core` 37 unit + 9 integration 全绿，`cargo build -p vibekey` 约 10 秒出 debug exe。
 - **在 Windows 上第一件事**：
   1. 用 stable MSVC 构建 debug 版（仅 Win10/11 跑）；
   2. 按 docs/testing.md 的 P0 清单逐项验证；
@@ -258,6 +261,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 
 ### P0：真机验证（不做就无法发布）
 
+- [x] Windows 11 x64：启动、托盘、右键菜单、设置窗口、单实例、退出、真键盘 Alt+1 插入（2026-11-06）
 - [ ] Win7 SP1 x64 / x86 上启动、托盘、Alt+数字、列表、配置菜单、设置窗口、同步全部按 testing.md 跑通
 - [ ] 菜单模式 / 前台激活 / 剪贴板 / hold 模式 / 自动重复这几处修复在真实程序（记事本、资源管理器、Office、微信、浏览器）中确认
 - [ ] 输入法为中文时插入是否正常
@@ -336,7 +340,10 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 
 ## 10. 当前产物与提交状态（2026-11-06 交接时）
 
-- 分支 main，无远程仓库（git remote 为空；接手后自行添加 origin）。
+- **源码与完整 git 历史在 `10.126.126.105`**（用户 zzq，`~/Vibekey`，6 个 commit，分支 master）。
+  Windows 工作区是用 `git clone` 拉回来的副本。原先工作区里那份 `.git` 是坏的（index 有条目、object 库为空），
+  已挪到 `C:\SAPrograms\vibekey-git-broken-20261106`。
+- 分支 master，无远程仓库（git remote 为空；接手后自行添加 origin）。
 - 最近提交：修复两轮 QA 问题后的版本（见 git log）。
 - dist/（git 忽略）：
 

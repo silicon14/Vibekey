@@ -60,6 +60,19 @@ Vibekey 的 Windows 前端无法在 Linux 上运行，合并前请在真实的 W
 - [ ] HTTPS WebDAV（Nextcloud 等）能在 Win7 上完成 TLS 握手（rustls 内置根证书，不依赖系统根证书）。
 - [ ] 中文用户名路径（%APPDATA% 含中文）下配置与日志正常读写。
 
+## 自动化冒烟的边界（2026-11-06 起）
+
+- 钩子对 `LLKHF_INJECTED` 的按键一律忽略（见 `crates/vibekey-win/src/hook.rs` 的 `keyboard_proc`），
+  所以 **SendInput/keybd_event 合成不出热键**；自动化只能覆盖托盘、右键菜单、设置窗口、单实例、退出这类
+  不依赖按键的路径。热键相关条目必须用真键盘人工验证。
+- 调试版可以打开测试口子：`set VIBEKEY_TEST_INJECTED=1` 后启动 `target\debug\vibekey.exe`，
+  合成按键即可触发热键，配合 PowerShell 的 SendInput 脚本可自动回归 Alt+数字 / Alt+反引号。
+  该分支包在 `#[cfg(debug_assertions)]` 里，release 构建（含 Win7 发布版）永远忽略注入输入。
+- 往文本框里打字一律用 `KEYEVENTF_UNICODE`（VK_PACKET）注入：不经过输入法、不产生拼音候选，
+  也不会和 `{clipboard}` 变量、剪贴板恢复互相干扰。
+- 屏幕锁定时（LogonUI/LockApp 在跑、`GetForegroundWindow()` 返回 0）任何输入注入都不会到达窗口，
+  自动化要先确认桌面未锁定。
+
 ## 本地 WebDAV 测试环境
 
 快速起一个标准 WebDAV 服务器（任选其一）：
