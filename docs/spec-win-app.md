@@ -80,14 +80,15 @@ restore_clipboard。
 3. 检查目标进程权限：OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) 失败且 GetLastError=5 时视为管理员窗口，
    报告“无法向管理员权限窗口输入”，放弃。
 4. paste 模式：
-   - 保存当前剪贴板 CF_UNICODETEXT（GetClipboardData）。
+   - 先用 EnumClipboardFormats 检查：纯文本才保存 CF_UNICODETEXT 并粘贴；文件/图片/富文本时不要覆盖剪贴板，
+     改为逐字符输入（实现：clipboard::inspect() → ClipboardContent::Rich 时回退 type 模式）。
    - OpenClipboard 重试 10 次、每次 10ms；EmptyClipboard；GlobalAlloc(GMEM_MOVEABLE) 写入 UTF-16（含结尾 0）；
      SetClipboardData(CF_UNICODETEXT)。
    - Sleep 50ms 后 SendInput Ctrl+V（4 个事件：Ctrl down, V down, V up, Ctrl up，V 用 KEYEVENTF_UNICODE 不需要；
      用虚拟键 VK_CONTROL/VK_V）。
    - 若 send_enter：Sleep 30ms 后发送 VK_RETURN 按下/抬起。
-   - 250ms 后恢复剪贴板文本（restore_clipboard 为 false 时跳过）。恢复动作由主线程 WM_TIMER 执行，
-     避免在工作线程里长期持有剪贴板；工作线程把“待恢复文本”交给主线程。
+   - 250ms 后恢复剪贴板文本（restore_clipboard 为 false 时跳过）。恢复必须在注入工作线程内串行执行，
+     避免主线程 TIMER 与后续注入任务竞争导致恢复成片段文本；原始剪贴板为空时恢复为空。
    - 任何一步失败 → 回退到 type 模式。
 5. type 模式：对 UTF-16 code unit 逐个 SendInput(KEYEVENTF_UNICODE)，每 2ms 一个，每 200 个字符让出 5ms。
    文本中的 \n 转换为 VK_RETURN 按下/抬起（KEYEVENTF_UNICODE 的 \n 在部分程序里无效）。

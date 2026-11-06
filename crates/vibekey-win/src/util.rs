@@ -10,12 +10,14 @@ use windows_sys::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics,
-    GetWindowThreadProcessId, MessageBoxW, GUITHREADINFO, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONWARNING, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
+    BringWindowToTop, GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+    GetSystemMetrics, GetWindowThreadProcessId, MessageBoxW, SetForegroundWindow, GUITHREADINFO,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 /// First message id available to applications.
@@ -33,10 +35,8 @@ pub const WM_APP_SYNC_NOW: u32 = WM_APP + 4;
 pub const WM_APP_SYNC_DONE: u32 = WM_APP + 5;
 /// An injection finished; wparam 0 = success, 1 = failure.
 pub const WM_APP_INJECT_DONE: u32 = WM_APP + 6;
-/// The inject thread handed a clipboard text back for delayed restoration.
-pub const WM_APP_CLIP_RESTORE: u32 = WM_APP + 7;
 /// The "test connection" worker finished; the result is in the settings state.
-pub const WM_APP_TEST_RESULT: u32 = WM_APP + 8;
+pub const WM_APP_TEST_RESULT: u32 = WM_APP + 7;
 
 pub const ACTION_LIST: usize = 1;
 pub const ACTION_CONFIG: usize = 2;
@@ -44,10 +44,8 @@ pub const ACTION_SNIPPET: usize = 3;
 
 /// WM_TIMER id used to poll the configuration file for modifications.
 pub const TIMER_CONFIG_POLL: usize = 1;
-/// WM_TIMER id used to restore the clipboard after a paste.
-pub const TIMER_CLIP_RESTORE: usize = 2;
 /// WM_TIMER id that fires after a single tray click delay.
-pub const TIMER_TRAY_CLICK: usize = 3;
+pub const TIMER_TRAY_CLICK: usize = 2;
 
 /// NUL terminated UTF-16 string.
 pub fn wide(text: &str) -> Vec<u16> {
@@ -196,9 +194,86 @@ pub fn clamp_to_monitor(point: POINT, width: i32, height: i32) -> POINT {
     }
 }
 
+/// Try to make hwnd the foreground window.
+///
+/// Windows only lets the foreground process (or a process that received the
+/// last user input) change the foreground window. The standard workaround is to
+/// attach the input queues of both threads for the duration of the call; it also
+/// gives the called window the keyboard focus it needs for the picker and menu.
+pub fn force_foreground(hwnd: HWND) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    // SAFETY: all handles are OS handles; the thread input attachment is
+    // detached again in the same call, and the pointers are valid stack values.
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+        };
+        let current_thread = GetCurrentThreadId();
+        let attached = foreground_thread != 0
+            && foreground_thread != current_thread
+            && AttachThreadInput(current_thread, foreground_thread, 1) != 0;
+        let mut ok = SetForegroundWindow(hwnd) != 0;
+        if !ok {
+            // SetActiveWindow/BringWindowToTop succeed in a few cases where
+            // SetForegroundWindow is refused, especially while attached.
+            SetActiveWindow(hwnd);
+            ok = BringWindowToTop(hwnd) != 0;
+        }
+        if attached {
+            AttachThreadInput(current_thread, foreground_thread, 0);
+        }
+        ok
+    }
+}
+
 /// Current process id.
 pub fn current_process_id() -> u32 {
     std::process::id()
+}
+
+/// Window class name of a window, empty when it cannot be queried.
+pub fn window_class_name(hwnd: HWND) -> String {
+    if hwnd.is_null() {
+        return String::new();
+    }
+    let mut buffer = [0u16; 256];
+    // SAFETY: the buffer and its length are valid; GetClassNameW only reads and
+    // tolerates stale handles by returning 0.
+    let length = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if length <= 0 {
+        String::new()
+    } else {
+        from_wide(&buffer[..length as usize])
+    }
+}
+
+/// True for the shell surfaces that own the taskbar and the desktop. They may
+/// legitimately be the foreground window (after a tray icon click) but they must
+/// never be used as an injection target.
+pub fn is_shell_surface(hwnd: HWND) -> bool {
+    matches!(
+        window_class_name(hwnd).as_str(),
+        "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Progman"
+            | "WorkerW"
+            | "NotifyIconOverflowWindow"
+    )
+}
+
+/// True when the window belongs to this process.
+pub fn is_our_process_window(hwnd: HWND) -> bool {
+    let mut process_id = 0u32;
+    // SAFETY: process_id is a valid out pointer.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut process_id);
+    }
+    process_id != 0 && process_id == current_process_id()
 }
 
 /// File name (without directory) of a process id, lower cased.

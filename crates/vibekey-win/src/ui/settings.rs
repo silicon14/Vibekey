@@ -533,7 +533,11 @@ unsafe extern "system" fn settings_proc(
             0
         }
         WM_DESTROY => {
-            crate::app::app_mut().settings = std::ptr::null_mut();
+            // SAFETY: window procedures only run on the main thread; the app may
+            // already be gone during shutdown.
+            if let Some(app) = unsafe { crate::app::try_app_mut() } {
+                app.settings = std::ptr::null_mut();
+            }
             0
         }
         WM_NCDESTROY => {

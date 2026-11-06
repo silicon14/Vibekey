@@ -50,33 +50,47 @@ fn open_run_key(access: u32) -> Option<HKEY> {
     }
 }
 
-/// Read the current autostart value.
+/// Read the current autostart value and compare it with the running executable.
+///
+/// The value is the quoted full path of the executable; comparing it (instead of
+/// only checking that the value exists) makes an installation that was moved or
+/// upgraded visible as "not enabled" again.
 pub fn is_enabled() -> bool {
     let Some(path) = exe_path() else {
         return false;
     };
-    let _ = path;
+    let expected = format!("\"{}\"", path.display());
     let Some(key) = open_run_key(KEY_QUERY_VALUE) else {
         return false;
     };
     let name = wide(VALUE_NAME);
     let mut value_type = 0u32;
-    let mut buffer = [0u8; 2048];
-    let mut size = buffer.len() as u32;
-    // SAFETY: all pointers refer to live stack memory of the documented types.
+    // u16 elements keep the buffer aligned for the UTF-16 result.
+    let mut buffer = [0u16; 2048];
+    let mut size = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+    // SAFETY: the buffer pointer and byte count describe the same allocation and
+    // all other pointers refer to live stack values of the documented types.
     let result = unsafe {
         RegQueryValueExW(
             key,
             name.as_ptr(),
             std::ptr::null(),
             &mut value_type,
-            buffer.as_mut_ptr(),
+            buffer.as_mut_ptr() as *mut u8,
             &mut size,
         )
     };
     // SAFETY: key came from RegOpenKeyExW and is closed exactly once.
     unsafe { RegCloseKey(key) };
-    result == ERROR_SUCCESS && value_type == REG_SZ && size > 2
+    if result != ERROR_SUCCESS || value_type != REG_SZ || size < 2 {
+        return false;
+    }
+    let units = ((size as usize) / std::mem::size_of::<u16>()).min(buffer.len());
+    let stored = String::from_utf16_lossy(&buffer[..units]);
+    // Windows paths are compared case insensitively.
+    stored
+        .trim_end_matches('\0')
+        .eq_ignore_ascii_case(&expected)
 }
 
 /// Enable or disable starting with Windows. The command line is the quoted full

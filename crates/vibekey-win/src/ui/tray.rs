@@ -56,17 +56,21 @@ impl Tray {
         }
         // SAFETY: data is fully initialised and lives for the duration of the
         // call; the window handle is a live window of this process.
-        let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &mut data) } != 0;
-        if ok {
-            self.added = true;
-        } else {
+        let mut added = unsafe { Shell_NotifyIconW(NIM_ADD, &mut data) } != 0;
+        if !added {
             // The shell may still have a stale icon from a previous run.
             // SAFETY: same as above.
             unsafe {
                 Shell_NotifyIconW(NIM_DELETE, &mut data);
-                Shell_NotifyIconW(NIM_ADD, &mut data);
+                added = Shell_NotifyIconW(NIM_ADD, &mut data) != 0;
             }
         }
+        if !added {
+            log::warn!("could not add the tray icon");
+        }
+        // Keep the flag in sync on both paths: it decides whether the icon is
+        // removed on exit and whether balloon tips are shown at all.
+        self.added = added;
     }
 
     /// Show a balloon tip. warning selects the warning icon.

@@ -110,7 +110,31 @@ impl Popup {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             ShowWindow(self.hwnd, SW_SHOW);
-            SetForegroundWindow(self.hwnd);
+        }
+        // SetForegroundWindow alone is often refused because this process is not
+        // the foreground process; force_foreground attaches the input queues
+        // while it tries. Without the foreground the list would ignore the
+        // arrow keys, Enter and Escape.
+        let activated = util::force_foreground(self.hwnd);
+        if !activated {
+            log::warn!("could not take the foreground for the snippet list");
+            // Keep the list visible above the target window even when it cannot
+            // become active.
+            // SAFETY: the window handle is valid.
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+        // SAFETY: the list box handle is valid.
+        unsafe {
             SetFocus(self.listbox);
         }
 
@@ -236,6 +260,15 @@ fn ensure_class() -> bool {
     true
 }
 
+/// Hide the popup when the application instance is still available.
+fn hide_popup() {
+    // SAFETY: window procedures only run on the main thread; the app may be gone
+    // during shutdown, in which case there is nothing to hide.
+    if let Some(app) = unsafe { crate::app::try_app_mut() } {
+        app.popup.hide();
+    }
+}
+
 /// Handler of the popup window itself.
 unsafe extern "system" fn popup_proc(
     hwnd: HWND,
@@ -248,16 +281,16 @@ unsafe extern "system" fn popup_proc(
             // Closing on WA_INACTIVE instead of WM_KILLFOCUS keeps the popup
             // open while the list box child owns the focus.
             if (wparam as u32 & 0xFFFF) == WA_INACTIVE {
-                crate::app::app_mut().popup.hide();
+                hide_popup();
             }
             0
         }
         WM_LBUTTONUP => {
-            crate::app::app_mut().popup.hide();
+            hide_popup();
             0
         }
         WM_CLOSE => {
-            crate::app::app_mut().popup.hide();
+            hide_popup();
             0
         }
         WM_ERASEBKGND => 1,
@@ -280,7 +313,7 @@ unsafe extern "system" fn listbox_proc(
                 return 0;
             }
             if key == VK_ESCAPE {
-                crate::app::app_mut().popup.hide();
+                hide_popup();
                 return 0;
             }
         }
@@ -325,16 +358,18 @@ unsafe fn execute_selected(hwnd: HWND) {
     if selection >= 0 {
         execute_index(selection as usize);
     } else {
-        crate::app::app_mut().popup.hide();
+        hide_popup();
     }
 }
 
 /// Hide the popup and hand the selected snippet to the main window, which
 /// expands it and queues the injection.
 fn execute_index(list_index: usize) {
-    // SAFETY: list box messages are only handled on the main thread while the
-    // app exists.
-    let app = unsafe { crate::app::app_mut() };
+    // SAFETY: list box messages are only handled on the main thread; during
+    // shutdown the app may already be gone, in which case nothing is injected.
+    let Some(app) = (unsafe { crate::app::try_app_mut() }) else {
+        return;
+    };
     let target = app.popup.target();
     let snippet_index = app.popup.item(list_index);
     app.popup.hide();

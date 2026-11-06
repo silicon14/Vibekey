@@ -1,11 +1,14 @@
 //! Clipboard text helpers.
 //!
-//! Only CF_UNICODETEXT is touched: the clipboard is opened with retries because
-//! another application may hold it for a few milliseconds.
+//! Only CF_UNICODETEXT is read and written: the clipboard is opened with retries
+//! because another application may hold it for a few milliseconds. The existing
+//! formats are inspected first so that richer clipboard content (files, images,
+//! HTML, RTF) is never destroyed by a paste.
 
 use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, OpenClipboard,
+    SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -14,6 +17,11 @@ use windows_sys::Win32::System::Memory::{
 /// CF_UNICODETEXT; defined here because the windows-sys module that owns the
 /// clipboard format constants (Win32_System_Ole) is not enabled.
 pub const CF_UNICODETEXT: u32 = 13;
+/// Clipboard formats that only carry plain text and may be replaced by a paste.
+const CF_TEXT: u32 = 1;
+const CF_OEMTEXT: u32 = 7;
+/// Language information that accompanies a text clipboard entry.
+const CF_LOCALE: u32 = 16;
 
 const OPEN_RETRIES: u32 = 10;
 const OPEN_RETRY_DELAY_MS: u64 = 10;
@@ -31,32 +39,110 @@ fn open_clipboard(owner: HWND) -> bool {
     false
 }
 
+/// What the clipboard currently holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardContent {
+    /// No formats at all.
+    Empty,
+    /// Only plain text formats; the text, when the owner provided one.
+    Text(Option<String>),
+    /// Files, images, HTML, RTF or any other non plain text format.
+    Rich,
+}
+
+/// Inspect the clipboard in one open/close cycle.
+///
+/// Returns None when the clipboard could not be opened, so callers can decide
+/// whether it is safe to continue (a paste needs the save/restore information).
+pub fn inspect() -> Option<ClipboardContent> {
+    if !open_clipboard(std::ptr::null_mut()) {
+        return None;
+    }
+    let mut formats = Vec::new();
+    // SAFETY: the clipboard is open; EnumClipboardFormats is called with the
+    // previous format (0 to start) until it returns 0. The clipboard is closed
+    // exactly once below.
+    unsafe {
+        let mut format = 0u32;
+        loop {
+            format = EnumClipboardFormats(format);
+            if format == 0 {
+                break;
+            }
+            formats.push(format);
+            if formats.len() > 256 {
+                break;
+            }
+        }
+        let rich = formats
+            .iter()
+            .any(|format| !matches!(*format, CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT | CF_LOCALE));
+        let text = if rich || formats.is_empty() {
+            None
+        } else {
+            read_text_locked()
+        };
+        CloseClipboard();
+        if rich {
+            Some(ClipboardContent::Rich)
+        } else if formats.is_empty() {
+            Some(ClipboardContent::Empty)
+        } else {
+            Some(ClipboardContent::Text(text))
+        }
+    }
+}
+
+/// Read CF_UNICODETEXT while the clipboard is already open.
+///
+/// SAFETY: the clipboard must be open and owned by the calling thread.
+unsafe fn read_text_locked() -> Option<String> {
+    let handle = GetClipboardData(CF_UNICODETEXT);
+    if handle.is_null() {
+        return None;
+    }
+    let pointer = GlobalLock(handle as HANDLE);
+    if pointer.is_null() {
+        return None;
+    }
+    let bytes = GlobalSize(handle as HANDLE);
+    let units = std::slice::from_raw_parts(pointer as *const u16, bytes / 2);
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    let text = String::from_utf16_lossy(&units[..end]);
+    GlobalUnlock(handle as HANDLE);
+    Some(text)
+}
+
 /// Read the current clipboard text, if any.
 pub fn read_text() -> Option<String> {
     if !open_clipboard(std::ptr::null_mut()) {
         return None;
     }
-    let mut result = None;
-    // SAFETY: the clipboard is open and is closed again below; the global
-    // memory handle is owned by the clipboard until it is closed.
-    unsafe {
-        let handle = GetClipboardData(CF_UNICODETEXT);
-        if !handle.is_null() {
-            let pointer = GlobalLock(handle as HANDLE);
-            if !pointer.is_null() {
-                let bytes = GlobalSize(handle as HANDLE);
-                let units = std::slice::from_raw_parts(pointer as *const u16, bytes / 2);
-                let end = units
-                    .iter()
-                    .position(|&unit| unit == 0)
-                    .unwrap_or(units.len());
-                result = Some(String::from_utf16_lossy(&units[..end]));
-                GlobalUnlock(handle as HANDLE);
-            }
-        }
+    // SAFETY: the clipboard is open and is closed exactly once below.
+    let result = unsafe {
+        let text = read_text_locked();
         CloseClipboard();
-    }
+        text
+    };
     result
+}
+
+/// Empty the clipboard again, used to restore the "no clipboard content" state
+/// after a paste. Returns false when the clipboard could not be opened.
+pub fn clear() -> bool {
+    if !open_clipboard(std::ptr::null_mut()) {
+        return false;
+    }
+    // SAFETY: the clipboard is open and is closed exactly once below.
+    let ok = unsafe {
+        let emptied = EmptyClipboard() != 0;
+        CloseClipboard();
+        emptied
+    };
+    ok
 }
 
 /// Replace the clipboard text. Returns false when the clipboard could not be

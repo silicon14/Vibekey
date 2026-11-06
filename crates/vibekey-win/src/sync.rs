@@ -80,6 +80,9 @@ pub struct SyncResult {
 pub struct SyncShared {
     main_hwnd: AtomicIsize,
     result: Mutex<Option<SyncResult>>,
+    /// True while a synchronisation step (possibly a blocking HTTP request) is
+    /// running. Used to avoid joining the thread during process exit.
+    busy: AtomicBool,
 }
 
 impl SyncShared {
@@ -122,7 +125,19 @@ impl SyncHandle {
         self.send(SyncCommand::Shutdown);
         self.sender = None;
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            // A running HTTP request cannot be interrupted. Give it a very short
+            // grace period and detach afterwards, so that an unresponsive server
+            // never blocks the application exit.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.shared.busy.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if self.shared.busy.load(Ordering::Acquire) {
+                log::warn!("a synchronisation is still running; detaching the sync thread");
+                drop(join);
+            } else {
+                let _ = join.join();
+            }
         }
     }
 }
@@ -141,6 +156,7 @@ pub fn start(
     let shared = Arc::new(SyncShared {
         main_hwnd: AtomicIsize::new(crate::util::hwnd_to_isize(main_hwnd)),
         result: Mutex::new(None),
+        busy: AtomicBool::new(false),
     });
     let shutdown = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel::<SyncCommand>();
@@ -192,7 +208,7 @@ fn worker(
             }
             Ok(SyncCommand::SyncNow { manual }) => {
                 if let Some(current) = settings.clone() {
-                    run_sync(&shared, &secrets, &current, manual);
+                    run_step(&shared, &secrets, &current, manual);
                 } else if manual {
                     finish(
                         &shared,
@@ -212,7 +228,7 @@ fn worker(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let (Some(current), Some(due)) = (settings.clone(), next_due) {
                     if Instant::now() >= due {
-                        run_sync(&shared, &secrets, &current, false);
+                        run_step(&shared, &secrets, &current, false);
                         next_due = Some(Instant::now() + interval);
                     }
                 }
@@ -220,6 +236,19 @@ fn worker(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+/// Run one synchronisation step, keeping the busy flag up to date so that
+/// SyncHandle::stop can decide between joining and detaching.
+fn run_step(
+    shared: &SyncShared,
+    secrets: &Arc<dyn SecretStore>,
+    settings: &SyncSettings,
+    manual: bool,
+) {
+    shared.busy.store(true, Ordering::Release);
+    run_sync(shared, secrets, settings, manual);
+    shared.busy.store(false, Ordering::Release);
 }
 
 fn run_sync(

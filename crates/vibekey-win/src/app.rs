@@ -1,8 +1,30 @@
 //! Application state, the hidden main window and the message loop.
 //!
 //! WndProc functions cannot carry user data, so the single App instance lives in
-//! a box whose address is published in the APP atomic pointer. Every message
-//! handler runs on the main thread.
+//! a box whose address is published in the APP atomic pointer.
+//!
+//! # Threading and aliasing contract
+//!
+//! Only the main (message loop) thread ever touches [App]: worker threads get
+//! their own small shared states instead. Window procedures obtain a short lived
+//! mutable reference per message from [try_app_mut] and tolerate `None` while
+//! the process shuts down. [message_loop] itself only holds a raw pointer, so no
+//! `&mut App` exists while [GetMessageW] blocks.
+//!
+//! Re-entrancy is expected: calling an API that pumps messages (MessageBoxW,
+//! TrackPopupMenu, IsDialogMessageW, ...) may dispatch a new message to one of
+//! our window procedures while the current handler is still on the stack. Each
+//! nested call re-reads the state from the APP pointer instead of relying on a
+//! cached reference, and no handler stores a raw `*mut App` between calls.
+//!
+//! Known residual caveat: a few handlers still hold their `&mut App` while they
+//! call a pumping API (the tray/menu command dispatch through TrackPopupMenu, the
+//! "about" and settings validation dialogs through MessageBoxW). This is a
+//! single threaded program and the handlers are written to be re-entrant, but
+//! strictly speaking Rust's aliasing rules are only fully satisfied by an
+//! interior mutability refactor (`RefCell`/`Cell` state) that is out of scope
+//! for this fix. Do not add new code that keeps borrowed App fields alive across
+//! such calls.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +32,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use vibekey_core::{expand, Config, ExpandContext, Keymap, Snippet};
+use vibekey_core::{Config, Keymap, Snippet};
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
@@ -29,9 +51,9 @@ use crate::ui::popup::Popup;
 use crate::ui::settings;
 use crate::ui::tray::Tray;
 use crate::util::{
-    self, hwnd_to_isize, wide, ACTION_CONFIG, ACTION_LIST, ACTION_SNIPPET, TIMER_CLIP_RESTORE,
-    TIMER_CONFIG_POLL, TIMER_TRAY_CLICK, WM_APP_ACTION, WM_APP_CLIP_RESTORE, WM_APP_INJECT_DONE,
-    WM_APP_RELOAD, WM_APP_SYNC_DONE, WM_APP_SYNC_NOW, WM_APP_TRAY,
+    self, hwnd_to_isize, wide, ACTION_CONFIG, ACTION_LIST, ACTION_SNIPPET, TIMER_CONFIG_POLL,
+    TIMER_TRAY_CLICK, WM_APP_ACTION, WM_APP_INJECT_DONE, WM_APP_RELOAD, WM_APP_SYNC_DONE,
+    WM_APP_SYNC_NOW, WM_APP_TRAY,
 };
 
 /// Time window in which the same notification category is suppressed.
@@ -68,14 +90,19 @@ pub struct App {
 
 static APP: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Access the single application instance.
+/// Access the single application instance, if it is still initialised.
 ///
-/// SAFETY: must only be called on the main thread while the App is alive, which
-/// is the case for every window procedure owned by this crate.
-pub unsafe fn app_mut<'a>() -> &'a mut App {
+/// SAFETY: only the main thread may call this while the App is alive. Window
+/// procedures can still receive messages while the application shuts down and
+/// the pointer is cleared, so they must use this function and tolerate None
+/// instead of dereferencing a stale pointer.
+pub unsafe fn try_app_mut<'a>() -> Option<&'a mut App> {
     let pointer = APP.load(Ordering::Acquire);
-    debug_assert!(!pointer.is_null(), "app accessed before initialisation");
-    &mut *pointer
+    if pointer.is_null() {
+        None
+    } else {
+        Some(&mut *pointer)
+    }
 }
 
 /// Create the mutex used for single instance detection. Returns the handle and
@@ -117,10 +144,13 @@ pub fn run() -> i32 {
 
     let pointer = Box::into_raw(Box::new(App::new(config_dir, mutex)));
     APP.store(pointer, Ordering::Release);
-    // SAFETY: the pointer was just created and is uniquely owned here.
-    let app = unsafe { &mut *pointer };
 
-    if !app.create_window() {
+    // Every access below is a short lived reference: no `&mut App` is kept
+    // across the message loop or across calls that pump Windows messages.
+    // SAFETY: the pointer was just created, is owned only by this function and
+    // only the main thread touches it.
+    let created = unsafe { (*pointer).create_window() };
+    if !created {
         log::error!("could not create the main window");
         APP.store(std::ptr::null_mut(), Ordering::Release);
         // SAFETY: the box was created above and is released exactly once.
@@ -129,8 +159,16 @@ pub fn run() -> i32 {
         }
         return 1;
     }
-    app.start();
-    let exit_code = app.message_loop();
+    // SAFETY: see above; no reference outlives the call.
+    let startup_warning = unsafe { (*pointer).start() };
+    if let Some(text) = startup_warning {
+        // Show the error outside of start(), so that message pumping cannot
+        // re-enter a window procedure while a &mut App is borrowed.
+        // SAFETY: short lived read of the window handle.
+        let hwnd = unsafe { (*pointer).hwnd };
+        util::message_box_warning(hwnd, &text, "Vibekey");
+    }
+    let exit_code = message_loop(pointer);
 
     APP.store(std::ptr::null_mut(), Ordering::Release);
     // SAFETY: the box is released exactly once; shutdown is idempotent.
@@ -209,11 +247,15 @@ impl App {
 
     /// Load the configuration and start the tray icon, the hook and the worker
     /// threads. Runs after the main window exists.
-    fn start(&mut self) {
+    ///
+    /// Returns a message that has to be shown by the caller *after* this method
+    /// returned: showing it here would pump messages while `&mut self` is
+    /// borrowed, which the aliasing contract in the module documentation forbids.
+    fn start(&mut self) -> Option<String> {
         // SAFETY: the message string is a valid NUL terminated buffer.
         self.taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
 
-        self.load_initial_config();
+        let warning = self.load_initial_config();
         self.tray = Some(Tray::add(self.hwnd));
 
         match hook::start(self.hwnd) {
@@ -248,26 +290,30 @@ impl App {
             self.config.snippet.len(),
             self.config_path.display()
         );
+        warning
     }
 
-    fn load_initial_config(&mut self) {
-        match Config::load_or_create(&self.config_path) {
-            Ok(config) => self.config = config,
+    /// Load the configuration, falling back to defaults when the file is broken
+    /// (the broken file is never overwritten). The returned text has to be shown
+    /// as an error dialog by the caller, outside of this method.
+    fn load_initial_config(&mut self) -> Option<String> {
+        let warning = match Config::load_or_create(&self.config_path) {
+            Ok(config) => {
+                self.config = config;
+                None
+            }
             Err(error) => {
                 log::error!("could not load the configuration: {error}");
                 self.config = Config::default();
-                util::message_box_warning(
-                    self.hwnd,
-                    &format!(
-                        "读取配置失败，已使用默认配置（不会覆盖原文件）。\n\n{}\n\n{error}",
-                        self.config_path.display()
-                    ),
-                    "Vibekey",
-                );
+                Some(format!(
+                    "读取配置失败，已使用默认配置（不会覆盖原文件）。\n\n{}\n\n{error}",
+                    self.config_path.display()
+                ))
             }
-        }
+        };
         self.rebuild_keymap(false);
         self.last_mtime = file_mtime(&self.config_path);
+        warning
     }
 
     fn rebuild_keymap(&mut self, report: bool) {
@@ -354,7 +400,10 @@ impl App {
         }
     }
 
-    /// Expand a snippet and queue it for injection.
+    /// Queue a snippet for injection.
+    ///
+    /// The template is expanded on the inject worker thread, so the clipboard is
+    /// only read by the thread that also owns the clipboard restore.
     pub fn inject_snippet(&mut self, index: usize, target: HWND) {
         let Some(snippet) = self.config.snippet.get(index) else {
             return;
@@ -362,17 +411,7 @@ impl App {
         if !snippet.enabled {
             return;
         }
-        let clipboard_text = crate::clipboard::read_text();
-        let now = chrono::Local::now();
-        let user = std::env::var("USERNAME").unwrap_or_default();
-        let host = std::env::var("COMPUTERNAME").unwrap_or_default();
-        let context = ExpandContext {
-            now,
-            clipboard: clipboard_text.as_deref(),
-            user: &user,
-            host: &host,
-        };
-        let text = expand(&snippet.text, &context);
+        let template = snippet.text.clone();
         let send_enter = snippet.send_enter;
         let target = if target.is_null() {
             // SAFETY: GetForegroundWindow has no preconditions.
@@ -381,7 +420,7 @@ impl App {
             target
         };
         let job = InjectJob {
-            text,
+            template,
             send_enter,
             target: hwnd_to_isize(target),
             input_method: self.config.input_method,
@@ -399,6 +438,11 @@ impl App {
 
     /// Open (or close) the snippet picker.
     pub fn open_list(&mut self) {
+        self.open_list_with_hint(std::ptr::null_mut());
+    }
+
+    /// Open the picker, preferring the window that triggered the hotkey.
+    fn open_list_with_hint(&mut self, hint: HWND) {
         if self.popup.is_open() {
             self.popup.hide();
             return;
@@ -419,21 +463,41 @@ impl App {
             .iter()
             .map(|&index| snippet_display_text(&self.config.snippet[index]))
             .collect();
-        let mut target = usable_foreground_window();
+        let mut target = std::ptr::null_mut();
+        // SAFETY: IsWindow accepts any handle and only reads.
+        if !hint.is_null()
+            && unsafe { IsWindow(hint) } != 0
+            && !util::is_our_process_window(hint)
+            && !util::is_shell_surface(hint)
+        {
+            target = hint;
+        }
         if target.is_null() {
-            // Opened from the tray icon: the shell owns the foreground window,
-            // so fall back to the last window that received a key press.
-            if let Some(handle) = self.hook.as_ref() {
-                let candidate = handle.shared().last_foreground();
-                // SAFETY: IsWindow accepts any handle and only reads.
-                if !candidate.is_null() && unsafe { IsWindow(candidate) } != 0 {
-                    target = candidate;
-                }
-            }
+            target = self.injection_target();
         }
         if !self.popup.show(self.hwnd, items, &texts, target) {
             self.notify("popup", "无法打开片段列表", true);
         }
+    }
+
+    /// Window that should receive the injection when the list is opened.
+    ///
+    /// The last window that really received a key press wins: when the picker
+    /// is opened from the tray icon the foreground window is the shell
+    /// (Shell_TrayWnd/Progman), which is never a valid injection target.
+    fn injection_target(&self) -> HWND {
+        if let Some(handle) = self.hook.as_ref() {
+            let candidate = handle.shared().last_foreground();
+            // SAFETY: IsWindow accepts any handle and only reads.
+            if !candidate.is_null()
+                && unsafe { IsWindow(candidate) } != 0
+                && !util::is_our_process_window(candidate)
+                && !util::is_shell_surface(candidate)
+            {
+                return candidate;
+            }
+        }
+        usable_foreground_window()
     }
 
     fn show_menu(&mut self, point: POINT) {
@@ -563,18 +627,6 @@ impl App {
         }
     }
 
-    fn restore_clipboard(&mut self) {
-        let pending = self
-            .inject
-            .as_ref()
-            .and_then(|handle| handle.shared().take_restore());
-        if let Some(text) = pending {
-            if !crate::clipboard::write_text(&text) {
-                log::warn!("could not restore the clipboard");
-            }
-        }
-    }
-
     fn poll_config(&mut self) {
         let current = file_mtime(&self.config_path);
         if current != self.last_mtime {
@@ -586,13 +638,6 @@ impl App {
     fn on_timer(&mut self, id: usize) {
         match id {
             TIMER_CONFIG_POLL => self.poll_config(),
-            TIMER_CLIP_RESTORE => {
-                // SAFETY: the window handle is live and the timer id is ours.
-                unsafe {
-                    KillTimer(self.hwnd, TIMER_CLIP_RESTORE);
-                }
-                self.restore_clipboard();
-            }
             TIMER_TRAY_CLICK => {
                 // SAFETY: the window handle is live and the timer id is ours.
                 unsafe {
@@ -608,18 +653,20 @@ impl App {
     }
 
     fn on_action(&mut self, action: usize, lparam: LPARAM) {
+        // The hook queues (action, foreground window) pairs in message order, so
+        // the window matches this action even when several actions are pending.
+        let trigger = self
+            .hook
+            .as_ref()
+            .map(|handle| handle.shared().take_trigger(action))
+            .unwrap_or(std::ptr::null_mut());
         match action {
-            ACTION_LIST => self.open_list(),
+            ACTION_LIST => self.open_list_with_hint(trigger),
             ACTION_CONFIG => {
                 let point = util::caret_pos();
                 self.show_menu(point);
             }
             ACTION_SNIPPET => {
-                let trigger = self
-                    .hook
-                    .as_ref()
-                    .map(|handle| handle.shared().take_trigger_hwnd())
-                    .unwrap_or(std::ptr::null_mut());
                 let target = if trigger.is_null() {
                     // SAFETY: GetForegroundWindow has no preconditions.
                     unsafe { GetForegroundWindow() }
@@ -704,33 +751,6 @@ impl App {
         }
     }
 
-    fn message_loop(&mut self) -> i32 {
-        let mut message: MSG = unsafe { std::mem::zeroed() };
-        loop {
-            // SAFETY: message is a valid out parameter; a null window filter
-            // retrieves messages for the whole thread.
-            let result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };
-            if result == 0 || result == -1 {
-                break;
-            }
-            let mut handled = false;
-            let settings = self.settings;
-            if !settings.is_null() && unsafe { IsWindow(settings) } != 0 {
-                // SAFETY: the message is valid and the window is live; the call
-                // only reads the message structure.
-                handled = unsafe { IsDialogMessageW(settings, &message) } != 0;
-            }
-            if !handled {
-                // SAFETY: the message was filled in by GetMessageW.
-                unsafe {
-                    TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
-        }
-        message.wParam as i32
-    }
-
     /// Remove the tray icon, stop the worker threads and end the message loop.
     fn shutdown(&mut self) {
         if self.quitting {
@@ -741,7 +761,6 @@ impl App {
         // SAFETY: the window handle is still live during WM_DESTROY.
         unsafe {
             KillTimer(self.hwnd, TIMER_CONFIG_POLL);
-            KillTimer(self.hwnd, TIMER_CLIP_RESTORE);
             KillTimer(self.hwnd, TIMER_TRAY_CLICK);
         }
         if let Some(mut tray) = self.tray.take() {
@@ -763,17 +782,53 @@ impl App {
     }
 }
 
+/// Run the main message loop until WM_QUIT.
+///
+/// Takes the raw App pointer instead of a reference so that no `&mut App` is
+/// alive while GetMessageW blocks and a window procedure may access the App.
+fn message_loop(pointer: *mut App) -> i32 {
+    let mut message: MSG = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: message is a valid out parameter; a null window filter
+        // retrieves messages for the whole thread.
+        let result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };
+        if result == 0 || result == -1 {
+            break;
+        }
+        // SAFETY: short lived read of one field; only the main thread touches
+        // App and no reference is kept across the dispatch below.
+        let settings = unsafe { (*pointer).settings };
+        let mut handled = false;
+        if !settings.is_null() && unsafe { IsWindow(settings) } != 0 {
+            // SAFETY: the message is valid and the window is live; the call only
+            // reads the message structure. It may dispatch WM_COMMAND to the
+            // settings window but never touches App directly.
+            handled = unsafe { IsDialogMessageW(settings, &message) } != 0;
+        }
+        if !handled {
+            // SAFETY: the message was filled in by GetMessageW; window
+            // procedures re-read the App state from the APP pointer.
+            unsafe {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+    message.wParam as i32
+}
+
 unsafe extern "system" fn main_window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let pointer = APP.load(Ordering::Acquire);
-    if pointer.is_null() {
+    // SAFETY: window procedures only run on the main thread; during shutdown the
+    // app may already be gone, in which case messages fall through to the
+    // default handling.
+    let Some(app) = try_app_mut() else {
         return DefWindowProcW(hwnd, message, wparam, lparam);
-    }
-    let app = &mut *pointer;
+    };
 
     if app.taskbar_created != 0 && message == app.taskbar_created {
         if let Some(tray) = app.tray.as_mut() {
@@ -811,17 +866,6 @@ unsafe extern "system" fn main_window_proc(
             app.on_sync_done();
             0
         }
-        WM_APP_CLIP_RESTORE => {
-            // Restore the clipboard a moment later, from the main thread, so
-            // the paste in the target application has completed.
-            SetTimer(
-                hwnd,
-                TIMER_CLIP_RESTORE,
-                crate::inject::CLIPBOARD_RESTORE_DELAY_MS,
-                None,
-            );
-            0
-        }
         WM_QUERYENDSESSION => 1,
         WM_ENDSESSION => {
             if wparam != 0 {
@@ -847,22 +891,18 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
         .and_then(|metadata| metadata.modified().ok())
 }
 
-/// Foreground window when it does not belong to this process, otherwise null.
+/// Foreground window when it belongs to another process and is not a shell
+/// surface, otherwise null.
 fn usable_foreground_window() -> HWND {
-    // SAFETY: GetForegroundWindow and GetWindowThreadProcessId have no
-    // preconditions.
-    unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.is_null() {
-            return std::ptr::null_mut();
-        }
-        let mut process_id = 0u32;
-        GetWindowThreadProcessId(foreground, &mut process_id);
-        if process_id == std::process::id() {
-            std::ptr::null_mut()
-        } else {
-            foreground
-        }
+    // SAFETY: GetForegroundWindow has no preconditions.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return std::ptr::null_mut();
+    }
+    if util::is_our_process_window(foreground) || util::is_shell_surface(foreground) {
+        std::ptr::null_mut()
+    } else {
+        foreground
     }
 }
 

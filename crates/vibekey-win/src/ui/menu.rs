@@ -3,11 +3,11 @@
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, PostMessageW, SetForegroundWindow, TrackPopupMenu,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, PostMessageW, TrackPopupMenu, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
 };
 
-use crate::util::wide;
+use crate::util::{self, wide};
 
 pub const CMD_LIST: u32 = 1;
 pub const CMD_EDIT_CONFIG: u32 = 2;
@@ -54,7 +54,12 @@ pub fn show(hwnd: HWND, point: POINT, state: &MenuState) -> Option<u32> {
         append(menu, MF_SEPARATOR, 0, "");
         append(menu, MF_STRING, CMD_EXIT, "退出");
 
-        SetForegroundWindow(hwnd);
+        // AttachThreadInput is needed because this process usually is not the
+        // foreground process when the tray icon is clicked; without the
+        // foreground the menu ignores the keyboard.
+        if !util::force_foreground(hwnd) {
+            log::warn!("could not take the foreground for the configuration menu");
+        }
         let result = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON,

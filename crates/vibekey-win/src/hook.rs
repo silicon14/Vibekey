@@ -5,6 +5,7 @@
 //! posts a message to the main window. It never performs file or network IO,
 //! which would make Windows remove the hook after the low level hook timeout.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -21,9 +22,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    PeekMessageW, PostMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
+    PeekMessageW, PostMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
 };
 
 use crate::util::{self, isize_to_hwnd, ACTION_CONFIG, ACTION_LIST, ACTION_SNIPPET, WM_APP_ACTION};
@@ -70,7 +71,9 @@ impl HookConfig {
 pub struct HookShared {
     config: RwLock<HookConfig>,
     main_hwnd: AtomicIsize,
-    trigger_hwnd: AtomicIsize,
+    /// (action, foreground window) pairs for the messages posted to the main
+    /// window. A queue keeps consecutive triggers paired with the right window.
+    triggers: std::sync::Mutex<VecDeque<Trigger>>,
     our_process: u32,
     /// Last queried process name; avoids an OpenProcess call on every hotkey.
     process_cache: std::sync::Mutex<Option<(u32, Option<String>)>>,
@@ -85,7 +88,7 @@ impl HookShared {
         Self {
             config: RwLock::new(HookConfig::default()),
             main_hwnd: AtomicIsize::new(0),
-            trigger_hwnd: AtomicIsize::new(0),
+            triggers: std::sync::Mutex::new(VecDeque::new()),
             our_process: util::current_process_id(),
             process_cache: std::sync::Mutex::new(None),
             last_foreground: AtomicIsize::new(0),
@@ -125,22 +128,59 @@ impl HookShared {
             .store(util::hwnd_to_isize(hwnd), Ordering::Release);
     }
 
-    /// Foreground window that triggered the last snippet action, or null.
-    pub fn take_trigger_hwnd(&self) -> HWND {
-        isize_to_hwnd(self.trigger_hwnd.swap(0, Ordering::AcqRel))
+    /// Remember the foreground window that caused an action. Called from the
+    /// hook callback, so only try_lock is used and the queue is length capped.
+    fn push_trigger(&self, action: usize, hwnd: HWND) {
+        if let Ok(mut queue) = self.triggers.try_lock() {
+            if queue.len() < 16 {
+                queue.push_back(Trigger {
+                    action,
+                    hwnd: hwnd as isize,
+                });
+            }
+        }
     }
+
+    /// Foreground window that caused the oldest pending action of this kind, or
+    /// null when the entry is missing (the caller then falls back to the current
+    /// foreground window).
+    pub fn take_trigger(&self, action: usize) -> HWND {
+        if let Ok(mut queue) = self.triggers.lock() {
+            if let Some(position) = queue.iter().position(|trigger| trigger.action == action) {
+                if let Some(trigger) = queue.remove(position) {
+                    return isize_to_hwnd(trigger.hwnd);
+                }
+            }
+        }
+        std::ptr::null_mut()
+    }
+}
+
+/// One pending (action, foreground window) pair.
+struct Trigger {
+    action: usize,
+    hwnd: isize,
 }
 
 /// The single installed hook. Its callback has no user data argument, so the
 /// shared state is reached through this atomic pointer which is only set before
 /// the hook is installed and cleared after it has been removed.
 static SHARED: AtomicPtr<HookShared> = AtomicPtr::new(std::ptr::null_mut());
+/// Wall clock (monotonic ms) of the current Alt press, 0 when Alt is up.
 static ALT_DOWN_MS: AtomicU64 = AtomicU64::new(0);
+/// Whether Alt is currently down. A held Alt produces repeated WM_SYSKEYDOWN
+/// messages; only the 0 -> 1 edge may start the hold timer, otherwise hold mode
+/// would never see the required hold time.
+static ALT_PRESSED: AtomicBool = AtomicBool::new(false);
 /// Last virtual key that went down and whether its key up was seen yet. A held
 /// key produces repeated WM_KEYDOWN messages without an intervening key up;
 /// those auto repeats must not trigger the snippet again.
 static LAST_VK: AtomicU32 = AtomicU32::new(0);
 static LAST_VK_DOWN: AtomicBool = AtomicBool::new(false);
+/// Virtual key whose first key down was swallowed by a hotkey. Its auto repeats
+/// have to be swallowed as well, otherwise the target application receives
+/// repeated Alt+<digit> system key messages.
+static CONSUMED_VK: AtomicU32 = AtomicU32::new(0);
 
 /// Milliseconds since the process started.
 fn monotonic_ms() -> u64 {
@@ -212,18 +252,33 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     let vk = keyboard.vkCode as u16;
     if vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU {
         if is_down {
-            ALT_DOWN_MS.store(monotonic_ms().max(1), Ordering::Release);
+            // Only the first key down of a press starts the hold timer; the
+            // auto repeats of a held Alt must not refresh it.
+            if !ALT_PRESSED.swap(true, Ordering::AcqRel) {
+                ALT_DOWN_MS.store(monotonic_ms().max(1), Ordering::Release);
+            }
         } else if is_up {
+            ALT_PRESSED.store(false, Ordering::Release);
             ALT_DOWN_MS.store(0, Ordering::Release);
         }
         return next();
     }
+    let consumed = CONSUMED_VK.load(Ordering::Relaxed);
     if !is_down {
-        // Key up: the key may trigger again on its next press.
+        // Key up: the key may trigger again on its next press. A key up also
+        // ends the "swallowed auto repeats" state.
+        if consumed == vk as u32 {
+            CONSUMED_VK.store(0, Ordering::Relaxed);
+        }
         if LAST_VK.load(Ordering::Relaxed) == vk as u32 {
             LAST_VK_DOWN.store(false, Ordering::Relaxed);
         }
         return next();
+    }
+    if consumed == vk as u32 {
+        // Auto repeat of a key whose first press triggered a hotkey: swallow it
+        // as well so that the target application never sees Alt+<digit>.
+        return 1;
     }
 
     let now = monotonic_ms();
@@ -236,8 +291,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     LAST_VK.store(vk as u32, Ordering::Relaxed);
     LAST_VK_DOWN.store(true, Ordering::Relaxed);
 
-    // Alt may have been pressed before this hook was installed.
-    if is_physically_down(VK_MENU) && ALT_DOWN_MS.load(Ordering::Relaxed) == 0 {
+    // Alt may have been pressed before this hook was installed: treat the first
+    // key we see while Alt is physically down as the start of the hold timer.
+    if is_physically_down(VK_MENU) && !ALT_PRESSED.swap(true, Ordering::AcqRel) {
         ALT_DOWN_MS.store(now.max(1), Ordering::Relaxed);
     }
 
@@ -308,25 +364,33 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     if main_hwnd.is_null() {
         return next();
     }
+    // From here on the key is swallowed: remember it so that its auto repeats are
+    // swallowed too.
+    CONSUMED_VK.store(vk as u32, Ordering::Release);
     let action = match binding {
         Binding::List => ACTION_LIST,
         Binding::Config => ACTION_CONFIG,
         Binding::Snippet(index) => {
-            shared
-                .trigger_hwnd
-                .store(foreground as isize, Ordering::Release);
+            shared.push_trigger(ACTION_SNIPPET, foreground);
             let index = index as isize;
             drop(config);
             PostMessageW(main_hwnd, WM_APP_ACTION, ACTION_SNIPPET, index);
             return 1;
         }
     };
+    shared.push_trigger(action, foreground);
     drop(config);
     PostMessageW(main_hwnd, WM_APP_ACTION, action, 0);
     1
 }
 
-fn hook_thread(_shared: Arc<HookShared>, ready: mpsc::Sender<Result<u32, String>>) {
+fn hook_thread(shared: Arc<HookShared>, events: mpsc::Sender<HookEvent>) {
+    HOOK_THREAD_ALIVE.store(true, Ordering::Release);
+    run_hook_thread(shared, events);
+    HOOK_THREAD_ALIVE.store(false, Ordering::Release);
+}
+
+fn run_hook_thread(_shared: Arc<HookShared>, events: mpsc::Sender<HookEvent>) {
     // SAFETY: this runs on the thread that will own the hook; the message queue
     // is created by PeekMessage before the thread id is published so that
     // PostThreadMessageW from the main thread cannot race with it.
@@ -342,6 +406,14 @@ fn hook_thread(_shared: Arc<HookShared>, ready: mpsc::Sender<Result<u32, String>
             PM_NOREMOVE,
         );
     }
+    // The thread id is published before the hook is installed so that the main
+    // thread can always shut this thread down, even when its start handshake
+    // timed out before the Ready message arrived.
+    HOOK_THREAD_ID.store(thread_id, Ordering::Release);
+    if events.send(HookEvent::Ready(thread_id)).is_err() {
+        // The main thread disappeared before the hook was installed.
+        return;
+    }
     // SAFETY: a null module name asks for the module handle of the executable.
     let module = unsafe { GetModuleHandleW(std::ptr::null()) };
     // SAFETY: the callback is a valid HOOKPROC and a thread id of 0 installs a
@@ -350,10 +422,12 @@ fn hook_thread(_shared: Arc<HookShared>, ready: mpsc::Sender<Result<u32, String>
     if hook.is_null() {
         // SAFETY: GetLastError has no preconditions.
         let code = unsafe { GetLastError() };
-        let _ = ready.send(Err(format!("SetWindowsHookExW 失败（错误 {code}）")));
+        let _ = events.send(HookEvent::Installed(Err(format!(
+            "SetWindowsHookExW 失败（错误 {code}）"
+        ))));
         return;
     }
-    if ready.send(Ok(thread_id)).is_err() {
+    if events.send(HookEvent::Installed(Ok(()))).is_err() {
         // The main thread disappeared; remove the hook and stop.
         // SAFETY: the hook handle is valid.
         unsafe {
@@ -382,10 +456,27 @@ fn hook_thread(_shared: Arc<HookShared>, ready: mpsc::Sender<Result<u32, String>
     }
 }
 
+/// Handshake message from the hook thread to the main thread.
+enum HookEvent {
+    /// The message queue exists; the payload is the id that WM_QUIT can be
+    /// posted to.
+    Ready(u32),
+    /// Result of SetWindowsHookExW.
+    Installed(Result<(), String>),
+}
+
+/// Thread id of the hook thread, published as soon as its message queue exists.
+/// It lets the main thread shut the thread down even when the start handshake
+/// timed out before the Ready message was received.
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+/// True while the hook thread runs. It is set before the thread id is published
+/// and cleared when the thread is about to exit, so that stop() never posts a
+/// WM_QUIT to a thread id that may already have been reused.
+static HOOK_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
+
 /// Handle to the hook thread.
 pub struct HookHandle {
     thread_id: u32,
-    installed: bool,
     shared: Arc<HookShared>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -395,23 +486,34 @@ impl HookHandle {
         &self.shared
     }
 
+    /// Stop the hook thread. A WM_QUIT is always posted before joining, so the
+    /// thread can never be joined while it is blocked in GetMessageW.
     pub fn stop(&mut self) {
         if let Some(join) = self.join.take() {
-            if self.installed && self.thread_id != 0 {
-                // SAFETY: the thread id belongs to the hook thread, which has a
-                // message queue; WM_QUIT makes its GetMessageW return 0.
-                unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-                        self.thread_id,
-                        WM_QUIT,
-                        0,
-                        0,
-                    );
-                }
+            let mut thread_id = self.thread_id;
+            if thread_id == 0 {
+                thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
             }
-            let _ = join.join();
-            self.installed = false;
+            if thread_id != 0 && HOOK_THREAD_ALIVE.load(Ordering::Acquire) {
+                // SAFETY: the id belongs to the hook thread, whose message queue
+                // exists before the id is published; WM_QUIT makes its
+                // GetMessageW return 0 and the thread removes the hook itself.
+                unsafe {
+                    PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+                }
+                let _ = join.join();
+            } else if thread_id != 0 {
+                // The thread already exited on its own; joining cannot block.
+                let _ = join.join();
+            } else {
+                // Without a thread id WM_QUIT cannot be delivered; detaching is
+                // better than blocking the process exit. The thread notices the
+                // closed handshake channel and exits on its own.
+                log::warn!("hook thread id is unknown; detaching instead of joining");
+                drop(join);
+            }
         }
+        HOOK_THREAD_ID.store(0, Ordering::Release);
         SHARED.store(std::ptr::null_mut(), Ordering::Release);
     }
 }
@@ -428,11 +530,13 @@ pub fn start(main_hwnd: HWND) -> Option<HookHandle> {
     shared.set_main_hwnd(main_hwnd);
     let shared_pointer = Arc::as_ptr(&shared) as *mut HookShared;
     SHARED.store(shared_pointer, Ordering::Release);
-    let (ready_tx, ready_rx) = mpsc::channel();
+    HOOK_THREAD_ID.store(0, Ordering::Release);
+    HOOK_THREAD_ALIVE.store(false, Ordering::Release);
+    let (event_tx, event_rx) = mpsc::channel();
     let thread_shared = Arc::clone(&shared);
     let join = match std::thread::Builder::new()
         .name("vibekey-hook".to_string())
-        .spawn(move || hook_thread(thread_shared, ready_tx))
+        .spawn(move || hook_thread(thread_shared, event_tx))
     {
         Ok(join) => join,
         Err(error) => {
@@ -441,31 +545,53 @@ pub fn start(main_hwnd: HWND) -> Option<HookHandle> {
             return None;
         }
     };
-    match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(thread_id)) => Some(HookHandle {
-            thread_id,
-            installed: true,
-            shared,
-            join: Some(join),
-        }),
-        Ok(Err(error)) => {
-            log::error!("{error}");
-            let _ = join.join();
-            SHARED.store(std::ptr::null_mut(), Ordering::Release);
-            None
+
+    // Two phase handshake: the thread id first, then the installation result.
+    let mut thread_id = 0u32;
+    let mut failure: Option<String> = None;
+    match event_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(HookEvent::Ready(id)) => {
+            thread_id = id;
+            match event_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(HookEvent::Installed(Ok(()))) => {}
+                Ok(HookEvent::Installed(Err(error))) => failure = Some(error),
+                Ok(HookEvent::Ready(_)) => {
+                    failure =
+                        Some("the hook thread sent an unexpected handshake message".to_string())
+                }
+                Err(error) => {
+                    failure = Some(format!(
+                        "the hook thread did not report the install result: {error}"
+                    ))
+                }
+            }
+        }
+        Ok(HookEvent::Installed(_)) => {
+            failure = Some("the hook thread sent an unexpected handshake message".to_string())
         }
         Err(error) => {
-            log::error!("the hook thread did not report back: {error}");
-            // The thread is still owned by the join handle, so shut it down
-            // through the handle rather than leaking it.
-            let mut handle = HookHandle {
-                thread_id: 0,
-                installed: false,
-                shared,
-                join: Some(join),
-            };
-            handle.stop();
-            None
+            thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
+            failure = Some(format!(
+                "the hook thread did not report its thread id: {error}"
+            ));
         }
     }
+
+    if let Some(error) = failure {
+        log::error!("{error}");
+        // Never join a thread that may still be waiting in GetMessageW: stop()
+        // posts WM_QUIT first whenever the thread id is known.
+        let mut handle = HookHandle {
+            thread_id,
+            shared,
+            join: Some(join),
+        };
+        handle.stop();
+        return None;
+    }
+    Some(HookHandle {
+        thread_id,
+        shared,
+        join: Some(join),
+    })
 }
