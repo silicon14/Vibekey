@@ -1,0 +1,9 @@
+[target.x86_64-win7-windows-gnu]
+linker = "x86_64-w64-mingw32-clang"
+
+[target.i686-win7-windows-gnu]
+linker = "i686-w64-mingw32-clang"
+
+[target.x86_64-pc-windows-msvc]
+# Build for Windows 10+ with the normal MSVC toolchain; Windows 7 users should
+# use the *-win7-windows-gnu targets above.
