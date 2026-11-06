@@ -1,0 +1,126 @@
+# Vibekey 配置文件示例（中文注释）
+#
+# 放到 %APPDATA%\Vibekey\config.toml 即可使用；程序首次启动时也会自动生成
+# 一份带示例片段的配置。修改后可用托盘菜单「重新加载配置」，程序也会自动
+# 检测文件变化。字段完整说明见 docs/config.md。
+#
+# TOML 语法：字符串用双引号，数组用 ["a", "b"]，支持 # 注释。
+
+# 触发方式：
+#   "immediate"  按住 Alt 后按数字键立即触发（默认，推荐）
+#   "hold"       必须先按住 Alt 超过 hold_ms 毫秒，再按数字键
+activation = "immediate"
+
+# 使用 "hold" 时，Alt 需要按住的毫秒数（100 - 3000）。
+hold_ms = 350
+
+# 文本注入方式：
+#   "paste"  写入剪贴板后发送 Ctrl+V（默认，中文/Unicode 最稳）
+#   "type"   用 SendInput 逐字符输入（适合不允许改动剪贴板的程序）
+input_method = "paste"
+
+# 粘贴后是否恢复剪贴板里原来的文本。只会恢复文本；原剪贴板中的图片、
+# 文件等会丢失，此时可设为 false 关闭恢复。
+restore_clipboard = true
+
+# 开机自动启动（写入 HKCU\Software\Microsoft\Windows\CurrentVersion\Run）。
+# 也可以用托盘菜单「开机启动」切换，菜单会回写这个字段。
+start_with_windows = false
+
+# 在这些程序里不触发快捷键（按进程 exe 文件名匹配，不区分大小写）。
+# 例如全屏游戏、会用到 Alt+数字的 IDE。
+ignore_apps = ["photoshop.exe"]
+
+[hotkeys]
+# 打开片段列表的快捷键，默认 Alt + 反引号（反引号键在 1 左边）。
+list = "alt+`"
+
+# 打开配置菜单的快捷键，默认 Alt + Backspace。
+config = "alt+backspace"
+
+[sync]
+# 是否启用 WebDAV 同步。密码不在本文件里：保存时由 Windows DPAPI 加密到
+# %APPDATA%\Vibekey\secret.bin，不会随配置文件同步，换机器需重新输入。
+enabled = false
+
+# 远端配置文件的完整 URL（指向文件，不是目录）。
+# Nextcloud 示例：
+#   https://cloud.example.com/remote.php/dav/files/<用户名>/vibekey/config.toml
+# 坚果云示例：
+#   https://dav.jianguoyun.com/dav/vibekey/config.toml
+# 自建 WebDAV 示例：
+#   https://dav.example.com/vibekey/config.toml
+url = "https://dav.example.com/vibekey/config.toml"
+
+# WebDAV 用户名。密码在设置窗口里单独填写。
+username = "me"
+
+# 每隔多少分钟自动同步一次；0 表示只手动同步 / 配置保存后同步。
+interval_minutes = 15
+
+# 保存配置后立即同步一次。
+sync_on_change = true
+
+# 两端都修改时，先把远端版本备份为 <url>.remote-backup-<时间戳>.toml，
+# 再用本地版本覆盖远端（本地优先，不自动合并）。
+backup_on_conflict = true
+
+# 网络超时（秒），必须大于 0。
+timeout_secs = 20
+
+# 片段。key 是 Alt 后按的键："1"..."9"、"0"、"-"、"="。
+# key = "" 表示只出现在列表里、没有直接快捷键。
+# 同一个 key 不能重复，也不能和 hotkeys.list / hotkeys.config 冲突。
+
+[[snippet]]
+key = "1"
+name = "打招呼"
+text = "你好，我是 {user}，很高兴认识你。"
+send_enter = false
+enabled = true
+
+[[snippet]]
+key = "2"
+name = "邮箱"
+text = "me@example.com"
+# 发送文本后自动按一次回车（例如聊天软件里直接发出）。
+send_enter = false
+enabled = true
+
+[[snippet]]
+key = "3"
+name = "当前时间"
+text = "现在是 {datetime}"
+enabled = true
+
+[[snippet]]
+key = "4"
+name = "带签名"
+text = """--
+{user} @ {host}
+{date}"""
+send_enter = false
+enabled = true
+
+[[snippet]]
+# 没有直接快捷键，只在 Alt+` 的列表里出现。
+key = ""
+name = "剪贴板内容"
+text = "{clipboard}"
+enabled = true
+
+[[snippet]]
+# enabled = false 的片段会被完全忽略（不出现在列表，也不能触发）。
+key = "9"
+name = "已停用的示例"
+text = "这条不会生效"
+enabled = false
+
+# 模板变量（在 text 里使用）：
+#   {date}       2026-11-06
+#   {time}       09:07
+#   {datetime}   2026-11-06 09:07
+#   {clipboard}  触发时剪贴板里的文本
+#   {user}       Windows 用户名
+#   {host}       计算机名
+# 写 {{date}} 会输出字面量 {date}；未知变量原样保留。

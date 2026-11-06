@@ -21,6 +21,7 @@ pub use config::{
     ActivationMode, Config, ConfigError, InputMethod, Issue, IssueLevel, Snippet, SyncConfig,
 };
 pub use expand::{expand, ExpandContext};
-pub use keymap::{Binding, Hotkey, Key, KeyError, Keymap, KeymapError};
+pub use keymap::{Binding, Hotkey, Key, KeyError, Keymap, KeymapError, Modifiers};
 pub use secret::{SecretError, SecretStore};
 pub use state::SyncState;
+pub use sync::{last_state, sync_once};

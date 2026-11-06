@@ -123,9 +123,7 @@ fn display_key(key: Key) -> String {
 }
 
 /// The slot keys that are bound to Alt by default: Alt+1 .. Alt+0, Alt+-, Alt+=.
-pub const SLOT_KEYS: [&str; 12] = [
-    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=",
-];
+pub const SLOT_KEYS: [&str; 12] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "="];
 
 pub fn is_slot_key(key: &str) -> bool {
     SLOT_KEYS.contains(&key)
@@ -397,7 +395,10 @@ mod tests {
             parse_hotkey("alt+nope"),
             Err(KeyError::UnknownKey(_))
         ));
-        assert!(matches!(parse_hotkey("alt+f99"), Err(KeyError::UnknownKey(_))));
+        assert!(matches!(
+            parse_hotkey("alt+f99"),
+            Err(KeyError::UnknownKey(_))
+        ));
     }
 
     #[test]

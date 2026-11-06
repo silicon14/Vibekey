@@ -131,7 +131,9 @@ impl<'a> SyncEngine<'a> {
             // The remote file disappeared; recreate it from the local file.
             (None, _) => {
                 self.push_local(state, &local_bytes, &local_hash, None)?;
-                Ok(SyncOutcome::Pushed { first_upload: false })
+                Ok(SyncOutcome::Pushed {
+                    first_upload: false,
+                })
             }
             // Local file unchanged: pull when the remote file changed.
             (Some(remote_cfg), false) => {
@@ -163,12 +165,13 @@ impl<'a> SyncEngine<'a> {
                 {
                     PutResult::Stored { etag } => {
                         self.finish(state, &local_hash, etag, "pushed");
-                        Ok(SyncOutcome::Pushed { first_upload: false })
+                        Ok(SyncOutcome::Pushed {
+                            first_upload: false,
+                        })
                     }
                     PutResult::PreconditionFailed => {
                         // Somebody changed the remote file between GET and PUT.
-                        let fresh = self.dav.get(&self.url)?.unwrap_or(remote_cfg);
-                        self.resolve_conflict(state, &local_bytes, &local_hash, &fresh, timestamp)
+                        self.recover_after_precondition(state, &local_bytes, &local_hash, timestamp)
                     }
                 }
             }
@@ -189,6 +192,66 @@ impl<'a> SyncEngine<'a> {
             }
             PutResult::PreconditionFailed => Err(SyncError::PreconditionFailed),
         }
+    }
+
+    /// The conditional PUT lost a race: somebody else wrote the remote file
+    /// between our GET and our PUT.
+    ///
+    /// Re-read the remote file and decide again instead of declaring a conflict
+    /// immediately:
+    ///
+    /// * remote is byte identical to the local file -> up to date;
+    /// * the remote content did not really change and only its ETag moved ->
+    ///   retry the conditional PUT once with the fresh ETag;
+    /// * the remote content changed -> fall back to the local-wins conflict
+    ///   resolution (including the remote backup).
+    fn recover_after_precondition(
+        &self,
+        state: &mut SyncState,
+        local_bytes: &[u8],
+        local_hash: &str,
+        timestamp: &str,
+    ) -> Result<SyncOutcome, SyncError> {
+        let mut fresh = match self.dav.get(&self.url)? {
+            Some(fresh) => fresh,
+            // The remote file vanished entirely; recreate it from the local one.
+            None => {
+                self.push_local(state, local_bytes, local_hash, None)?;
+                return Ok(SyncOutcome::Pushed {
+                    first_upload: false,
+                });
+            }
+        };
+
+        if fresh.body == local_bytes {
+            self.finish(state, local_hash, fresh.etag.clone(), "up-to-date");
+            return Ok(SyncOutcome::UpToDate);
+        }
+
+        let fresh_hash = content_hash(&fresh.body);
+        let remote_really_changed = state.remote_hash.as_deref() != Some(fresh_hash.as_str());
+        if !remote_really_changed {
+            match self
+                .dav
+                .put(&self.url, local_bytes, fresh.etag.as_deref())?
+            {
+                PutResult::Stored { etag } => {
+                    self.finish(state, local_hash, etag, "pushed");
+                    return Ok(SyncOutcome::Pushed {
+                        first_upload: false,
+                    });
+                }
+                PutResult::PreconditionFailed => {
+                    // Another writer got in between again: keep the newest
+                    // remote content for the conflict backup.
+                    if let Some(newest) = self.dav.get(&self.url)? {
+                        fresh = newest;
+                    }
+                }
+            }
+        }
+
+        self.resolve_conflict(state, local_bytes, local_hash, &fresh, timestamp)
     }
 
     fn resolve_conflict(
@@ -219,11 +282,7 @@ impl<'a> SyncEngine<'a> {
         }
     }
 
-    fn apply_pull(
-        &self,
-        remote: &RemoteConfig,
-        state: &mut SyncState,
-    ) -> Result<(), SyncError> {
+    fn apply_pull(&self, remote: &RemoteConfig, state: &mut SyncState) -> Result<(), SyncError> {
         let text = std::str::from_utf8(&remote.body)
             .map_err(|_| SyncError::RemoteInvalid("file is not valid UTF-8".to_string()))?;
         Config::parse(text).map_err(|err| SyncError::RemoteInvalid(err.to_string()))?;
@@ -304,6 +363,9 @@ mod tests {
         files: Mutex<HashMap<String, (Vec<u8>, Option<String>)>>,
         etag_counter: AtomicU32,
         reject_next_put: AtomicBool,
+        /// When set, the next PUT stores this body (simulating another writer)
+        /// and fails with a precondition failure.
+        race_on_next_put: Mutex<Option<Vec<u8>>>,
     }
 
     impl MemoryDav {
@@ -319,8 +381,15 @@ mod tests {
             self.stored(url).map(|(body, _)| body)
         }
 
+        fn new_etag(&self) -> String {
+            format!(
+                "etag-{}",
+                self.etag_counter.fetch_add(1, Ordering::SeqCst) + 1
+            )
+        }
+
         fn put_direct(&self, url: &str, body: &[u8]) -> Option<String> {
-            let etag = format!("etag-{}", self.etag_counter.fetch_add(1, Ordering::SeqCst) + 1);
+            let etag = self.new_etag();
             self.files
                 .lock()
                 .unwrap()
@@ -330,6 +399,12 @@ mod tests {
 
         fn reject_next_put(&self) {
             self.reject_next_put.store(true, Ordering::SeqCst);
+        }
+
+        /// Simulate a concurrent writer: the next conditional PUT fails but the
+        /// remote file is replaced by `body` first.
+        fn race_next_put(&self, body: Vec<u8>) {
+            *self.race_on_next_put.lock().unwrap() = Some(body);
         }
 
         fn keys(&self) -> Vec<String> {
@@ -343,10 +418,25 @@ mod tests {
         }
 
         fn get(&self, url: &str) -> Result<Option<RemoteConfig>, SyncError> {
-            Ok(self.stored(url).map(|(body, etag)| RemoteConfig { body, etag }))
+            Ok(self
+                .stored(url)
+                .map(|(body, etag)| RemoteConfig { body, etag }))
         }
 
-        fn put(&self, url: &str, body: &[u8], if_match: Option<&str>) -> Result<PutResult, SyncError> {
+        fn put(
+            &self,
+            url: &str,
+            body: &[u8],
+            if_match: Option<&str>,
+        ) -> Result<PutResult, SyncError> {
+            if let Some(raced_body) = self.race_on_next_put.lock().unwrap().take() {
+                let etag = self.new_etag();
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(url.to_string(), (raced_body, Some(etag)));
+                return Ok(PutResult::PreconditionFailed);
+            }
             if self.reject_next_put.swap(false, Ordering::SeqCst) {
                 return Ok(PutResult::PreconditionFailed);
             }
@@ -357,7 +447,7 @@ mod tests {
                     _ => return Ok(PutResult::PreconditionFailed),
                 }
             }
-            let etag = format!("etag-{}", self.etag_counter.fetch_add(1, Ordering::SeqCst) + 1);
+            let etag = self.new_etag();
             files.insert(url.to_string(), (body.to_vec(), Some(etag.clone())));
             Ok(PutResult::Stored { etag: Some(etag) })
         }
@@ -382,7 +472,10 @@ mod tests {
         let engine = SyncEngine::new(&dav, URL, &path, true);
         let outcome = engine.sync(&mut state, TS).unwrap();
         assert_eq!(outcome, SyncOutcome::Pushed { first_upload: true });
-        assert_eq!(dav.body(URL).unwrap(), config.to_toml().unwrap().into_bytes());
+        assert_eq!(
+            dav.body(URL).unwrap(),
+            config.to_toml().unwrap().into_bytes()
+        );
         assert!(state.local_hash.is_some());
         assert!(state.remote_etag.is_some());
     }
@@ -405,11 +498,18 @@ mod tests {
         engine.sync(&mut state, TS).unwrap();
 
         let mut changed = Config::example();
-        changed.snippet.push(crate::config::Snippet::new("4", "新", "新内容"));
+        changed
+            .snippet
+            .push(crate::config::Snippet::new("4", "新", "新内容"));
         changed.save(&path).unwrap();
 
         let outcome = engine.sync(&mut state, TS).unwrap();
-        assert_eq!(outcome, SyncOutcome::Pushed { first_upload: false });
+        assert_eq!(
+            outcome,
+            SyncOutcome::Pushed {
+                first_upload: false
+            }
+        );
         assert_eq!(dav.body(URL).unwrap(), read(&path));
     }
 
@@ -489,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn precondition_failure_falls_back_to_conflict_resolution() {
+    fn precondition_failure_is_retried_with_the_fresh_etag() {
         let (_dir, path, _config, dav) = setup();
         let mut state = SyncState::default();
         let engine = SyncEngine::new(&dav, URL, &path, true);
@@ -500,8 +600,44 @@ mod tests {
         local.save(&path).unwrap();
         dav.reject_next_put();
 
+        // The remote content did not change, only the conditional write lost a
+        // race. The engine re-reads the ETag and retries instead of reporting a
+        // conflict.
         let outcome = engine.sync(&mut state, TS).unwrap();
-        assert!(matches!(outcome, SyncOutcome::ConflictLocalWins { .. }));
+        assert_eq!(
+            outcome,
+            SyncOutcome::Pushed {
+                first_upload: false
+            }
+        );
+        assert_eq!(dav.body(URL).unwrap(), read(&path));
+        assert!(dav.keys().iter().all(|key| !key.contains("remote-backup")));
+    }
+
+    #[test]
+    fn precondition_failure_with_a_real_remote_change_resolves_conflict() {
+        let (_dir, path, _config, dav) = setup();
+        let mut state = SyncState::default();
+        let engine = SyncEngine::new(&dav, URL, &path, true);
+        engine.sync(&mut state, TS).unwrap();
+
+        let mut local = Config::example();
+        local.snippet[0].text = "local edit".to_string();
+        local.save(&path).unwrap();
+
+        let mut raced = Config::example();
+        raced.snippet[0].text = "remote raced".to_string();
+        dav.race_next_put(raced.to_toml().unwrap().into_bytes());
+
+        let outcome = engine.sync(&mut state, TS).unwrap();
+        match outcome {
+            SyncOutcome::ConflictLocalWins { remote_backup } => {
+                let backup = remote_backup.expect("backup url");
+                let backed_up = String::from_utf8(dav.body(&backup).unwrap()).unwrap();
+                assert!(backed_up.contains("remote raced"));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
         assert_eq!(dav.body(URL).unwrap(), read(&path));
     }
 
@@ -514,7 +650,12 @@ mod tests {
 
         dav.files.lock().unwrap().remove(URL);
         let outcome = engine.sync(&mut state, TS).unwrap();
-        assert_eq!(outcome, SyncOutcome::Pushed { first_upload: false });
+        assert_eq!(
+            outcome,
+            SyncOutcome::Pushed {
+                first_upload: false
+            }
+        );
         assert!(dav.body(URL).is_some());
     }
 
@@ -533,7 +674,12 @@ mod tests {
         dav.put_direct(URL, remote.to_toml().unwrap().as_bytes());
 
         let outcome = engine.sync(&mut state, TS).unwrap();
-        assert_eq!(outcome, SyncOutcome::ConflictLocalWins { remote_backup: None });
+        assert_eq!(
+            outcome,
+            SyncOutcome::ConflictLocalWins {
+                remote_backup: None
+            }
+        );
         assert!(dav.keys().iter().all(|key| !key.contains("remote-backup")));
     }
 }

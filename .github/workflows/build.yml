@@ -1,0 +1,154 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with the default in scripts/install-toolchain.sh.
+  LLVM_MINGW_VERSION: "20261104"
+  LLVM_MINGW_NAME: llvm-mingw-20261104-msvcrt-ubuntu-22.04-x86_64
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Platform independent core: config, keymap, template expansion, WebDAV sync.
+  # ---------------------------------------------------------------------------
+  core-test:
+    name: core tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+
+      - name: Test vibekey-core
+        run: cargo test -p vibekey-core --all-targets
+
+      - name: Build vibekey-core
+        run: cargo build -p vibekey-core --release
+
+      - name: Validate assets/config.example.toml
+        run: |
+          python3 - <<'PY'
+          import tomllib
+          with open("assets/config.example.toml", "rb") as fh:
+              data = tomllib.load(fh)
+          snippets = data.get("snippet", [])
+          assert isinstance(snippets, list) and snippets, "example config has no snippets"
+          print(f"example config OK: {len(snippets)} snippets")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Windows 7 SP1 targets (tier 3, nightly -Z build-std, llvm-mingw MSVCRT).
+  # The resulting executables are the ones shipped to users.
+  # ---------------------------------------------------------------------------
+  win7-cross:
+    name: Win7 cross build (x86_64 + i686)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly + rust-src
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+
+      # Same download as scripts/install-toolchain.sh. The MSVCRT flavour links
+      # against the system msvcrt.dll, which exists on every Windows 7 install
+      # (the UCRT does not).
+      - name: Download llvm-mingw (MSVCRT flavour)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/toolchains"
+          url="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${LLVM_MINGW_NAME}.tar.xz"
+          echo "downloading $url"
+          curl -fL --retry 3 -o /tmp/llvm-mingw.tar.xz "$url"
+          tar -xf /tmp/llvm-mingw.tar.xz -C "$HOME/toolchains"
+          rm -f /tmp/llvm-mingw.tar.xz
+
+      # Rust's *-windows-gnu targets ask the linker for libgcc/libgcc_eh, but
+      # llvm-mingw ships compiler-rt instead. Provide the same thin symlinks as
+      # scripts/install-toolchain.sh.
+      - name: Add libgcc compatibility symlinks
+        run: |
+          set -euo pipefail
+          MINGW="$HOME/toolchains/${LLVM_MINGW_NAME}"
+          for ARCH in x86_64 i686; do
+            case "$ARCH" in
+              x86_64) BUILTINS="libclang_rt.builtins-x86_64.a" ;;
+              i686)   BUILTINS="libclang_rt.builtins-i386.a" ;;
+            esac
+            LIB="$MINGW/$ARCH-w64-mingw32/lib"
+            ln -sf "$MINGW"/lib/clang/*/lib/windows/"$BUILTINS" "$LIB/libgcc.a"
+            ln -sf "$LIB/libunwind.a" "$LIB/libgcc_eh.a"
+          done
+          ls -l "$MINGW/x86_64-w64-mingw32/lib/libgcc.a" "$MINGW/i686-w64-mingw32/lib/libgcc.a"
+
+      - name: Build both Windows 7 targets
+        run: |
+          set -euo pipefail
+          scripts/build-win.sh x86_64-win7-windows-gnu
+          scripts/build-win.sh i686-win7-windows-gnu
+
+      - name: Verify PE headers and imports (Win7 compatibility)
+        run: |
+          set -euo pipefail
+          scripts/verify-win7-pe.sh \
+            target/x86_64-win7-windows-gnu/release/vibekey.exe \
+            target/i686-win7-windows-gnu/release/vibekey.exe
+
+      - name: Package release directories
+        run: scripts/package-release.sh --skip-build
+
+      - name: Upload Windows 7 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibekey-win7
+          path: dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows 10+ native build with the stable MSVC toolchain. This is a
+  # convenience artifact only: stable *-pc-windows-msvc binaries cannot run on
+  # Windows 7 (prebuilt std requires Windows 10 since Rust 1.78).
+  # ---------------------------------------------------------------------------
+  windows-native:
+    name: Windows native build (MSVC, Win10+)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+
+      - name: Build (MSVC, Windows 10+)
+        run: cargo build --release -p vibekey --target x86_64-pc-windows-msvc
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibekey-windows-native
+          path: target/x86_64-pc-windows-msvc/release/vibekey.exe
+          if-no-files-found: error
