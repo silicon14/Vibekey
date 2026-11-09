@@ -111,15 +111,16 @@ restore_clipboard。
 
 TrackPopupMenu（右键托盘或 Alt+Backspace）菜单项：
 
-1. 片段列表...
-2. 编辑配置文件（notepad.exe 打开 config.toml）
-3. 重新加载配置
-4. 立即同步（未启用同步时禁用；同步中禁用）
-5. WebDAV 设置...
-6. 开机启动（勾选状态来自 Config.start_with_windows，点击写注册表 + 保存配置）
-7. 打开日志文件
-8. 关于（版本号、快捷键说明、配置路径）
-9. 退出
+1. 片段列表…
+2. 新建片段…
+3. 设置与片段管理…
+4. 编辑 TOML 配置（notepad.exe 打开 config.toml）
+5. 重新加载配置
+6. 立即同步（未启用同步时禁用；同步中禁用）
+7. 开机启动（勾选状态来自 Config.start_with_windows，点击写注册表 + 保存配置）
+8. 打开日志文件
+9. 关于（版本号、快捷键说明、配置路径）
+10. 退出
 
 实现要点：SetForegroundWindow(主窗口) → TrackPopupMenu(TPM_RETURNCMD|TPM_RIGHTBUTTON) →
 PostMessageW(主窗口, WM_NULL, 0, 0)。坐标用 GetCursorPos（托盘）或光标插入符位置（Alt+Backspace 用
@@ -127,35 +128,35 @@ GetGUIThreadInfo 的 rcCaret → ClientToScreen，失败回退 GetCursorPos）�
 
 ### ui/popup.rs（片段列表）
 
-- 自绘窗口类 "VibekeyPopup"：WS_POPUP|WS_BORDER，WS_EX_TOPMOST|WS_EX_TOOLWINDOW，子控件 ListBox（WS_CHILD|WS_VISIBLE|
-  WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT）。
-- 每条目："1. 名称 — 首行预览"（预览截断到约 40 字符，换行符替换为空格）；无快捷键的条目显示 "-."。
-- 尺寸：宽约 520 逻辑像素（按 DPI 缩放），高 min(条目*22+8, 420)；位置优先插入符：
-  GetGUIThreadInfo(GetWindowThreadProcessId(GetForegroundWindow())) → gui.rcCaret → ClientToScreen；
-  失败用 GetCursorPos；再向屏幕内收（MonitorFromPoint / GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)）。
-- 显示后 SetForegroundWindow + SetFocus(ListBox) + 选中第一项。
-- 交互：Enter / 双击 / 单击条目（LBN_SELCHANGE 后立即执行）→ 隐藏弹窗并把片段索引发给注入线程；Esc → 关闭；
-  WM_KILLFOCUS / WM_ACTIVATE(WA_INACTIVE) → 关闭；点击空白 → 关闭。
-  单击立即执行和方向键选择会冲突，所以只在 LB_GETCURSEL 对应项被真正点击时执行（用 ListBox 的 LBN_SELCHANGE 无法区分，
-  建议子类化 ListBox 处理 WM_LBUTTONUP，或使用 LBN_DBLCLK + Enter，二选一并在代码注释说明）。
+- 自绘窗口类 "VibekeyPopup"：WS_POPUP，WS_EX_TOPMOST|WS_EX_TOOLWINDOW；共享 ui::theme 的浅色配色和中文字体。
+- 顶部为标题和搜索 EDIT（EM_SETCUEBANNER），按名称、快捷键或内容预览过滤；中间是 LBS_OWNERDRAWFIXED ListBox，
+  每行显示 Alt 槽位徽标、名称和首行预览；底部显示结果数、“新建片段”和“编辑所选(F2)”。
+- 尺寸约 600 逻辑像素宽、最大约 600 高，所有控件按 DPI 和 WM_SIZE 重排；宽高先按当前显示器工作区限制，再优先插入符定位，超出部分由列表滚动承载。
+- 鼠标命中同时校验 LB_ITEMFROMPOINT 与 LB_GETITEMRECT，过滤后点击末行以下的空白不得执行最近一项。
+- 显示后 force_foreground + SetFocus，保留原来的目标窗口记录与失焦关闭行为。
+- 交互：Enter / 单击 / 双击条目 → 隐藏弹窗并注入；Esc → 关闭；F2 / 右键 / 编辑按钮 →
+  App::open_snippet_editor(Some(index))；新建按钮 → App::open_snippet_editor(None)。现有项同时携带 App 快照内容，
+  设置窗按完整 Snippet 身份匹配，未保存插入/删除或外部重载导致索引移位时不得按旧位置猜测。
+  单击仍由 ListBox 子类化的 WM_LBUTTONUP 判定，避免与方向键选择冲突。
 - 弹窗打开期间钩子透传，不触发片段。
 
-### ui/settings.rs（设置窗口）
+### ui/settings.rs（设置与片段管理）
 
-普通顶层窗口（WS_OVERLAPPEDWINDOW 去掉最大化），标题 "Vibekey 设置"，控件用 EDIT/BUTTON/COMBOBOX 程序化创建，
-字体 DEFAULT_GUI_FONT，支持 Tab 导航（消息循环里对设置窗口调用 IsDialogMessageW）。
+普通可调整大小的 WS_OVERLAPPEDWINDOW 顶层窗口，标题 "Vibekey · 设置与片段管理"。共享 ui::theme 的字体、
+画刷与自绘导航/列表，使用 EDIT/BUTTON/COMBOBOX/LISTBOX 程序化创建；消息循环继续用 IsDialogMessageW 支持 Tab 导航。
+窗口分为三个页面；默认采用宽松双栏布局，较矮窗口自动切换紧凑布局，最小尺寸还会按工作区限制：
 
-控件：
+- 片段库：搜索、owner-drawn 列表、新建/复制/删除；右侧直接编辑名称、12 个 Alt 槽位（或不绑定）、多行正文、
+  send_enter、enabled；模板变量 combo + 插入按钮用 EM_REPLACESEL 插入到当前光标。
+- 输入与快捷键：paste/type、restore_clipboard、immediate/hold、hold_ms、start_with_windows、list/config 全局热键、
+  ignore_apps。所有 Config 行为字段都有图形化入口。
+- 同步与备份：enabled、URL、用户名、密码、interval_minutes、timeout_secs、sync_on_change、backup_on_conflict、
+  测试连接和“清除已保存密码”。密码继续只走 SecretStore，清除操作在应用时执行。
 
-- 同步：启用同步 checkbox；WebDAV URL edit；用户名 edit；密码 edit（ES_PASSWORD）；间隔分钟 edit；
-  保存后同步 checkbox；冲突时备份远端 checkbox。
-- 行为：输入方式 combo（粘贴 / 直接输入）；触发方式 combo（立即 / 按住 Alt）；开机启动 checkbox。
-- 按钮：保存（IDOK）、取消（IDCANCEL）、测试连接。
-- 测试连接：用当前 URL/用户名/密码做一次 GET（超时 10 秒），MessageBox 显示结果；必须能取消/不卡死（可用工作线程）。
-
-保存流程：构造新 Config（密码单独走 SecretStore::store_password）→ Config::save → 更新开机启动注册表 →
-通知主窗口 WM_APP_RELOAD → 触发一次同步（若启用）。保存失败 MessageBox 错误。
-取消/关闭不落盘。
+编辑先更新窗口内 Config 工作副本，取消/关闭有未保存确认，不直接写文件。应用/保存流程：
+读取其它页面控件 → 校验数值范围、WebDAV URL 和 Keymap（含重复槽位）→ 检测 external mtime 变化并确认 →
+保存/清除密码 → Config::save 原子写 → 更新开机启动 → PostMessage WM_APP_RELOAD → 按 sync_on_change 请求同步。
+“应用”保持窗口打开，“保存并关闭”随后 DestroyWindow。保存失败显示中文 MessageBox 并保留编辑内容。
 
 ### secret.rs
 
@@ -219,5 +220,5 @@ SyncEngine/WebDav/UreqWebDav/SyncState/SyncError/SyncOutcome、SecretStore/Secre
    （按代码审查判断；无法在 Linux 运行）。
 3. 配置文件坏掉时程序不崩溃，提示并保留旧配置。
 4. 所有用户可见文案为中文；代码注释可用英文。
-5. 不修改 crates/vibekey-core 与 scripts/、docs/、.github/ 下文件。文件范围：crates/vibekey-win/**（assets/icon.ico 已由 Lead 提供，勿覆盖）。
+5. 不随意修改 crates/vibekey-core、scripts/、.github/ 或覆盖 assets/icon.ico；界面/行为变化应同步更新 README 与 docs 中的对应说明。
 6. 完成后在自己的最后一条消息里列：已实现文件清单、未实现/待办、编译命令与结果、风险点。

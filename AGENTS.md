@@ -47,9 +47,9 @@
 ### 功能
 
 - Alt+1 … Alt+9、Alt+0、Alt+-、Alt+=：12 个槽位直接插入片段文字
-- Alt+反引号（1 左边那颗 · 键）：弹出可选择的片段列表（方向键/Enter/Esc/单击）
-- Alt+Backspace 或右键托盘：配置菜单（列表、编辑配置、重载、立即同步、WebDAV 设置、开机启动、日志、关于、退出）
-- 设置窗口：WebDAV、触发方式（immediate/hold）、输入方式（paste/type）、开机启动
+- Alt+反引号（1 左边那颗 · 键）：可搜索的片段列表（方向键/Enter/Esc/单击，F2/右键快速编辑）
+- Alt+Backspace 或右键托盘：配置菜单（列表、新建片段、设置、TOML、重载、同步、启动、日志、关于、退出）
+- 统一设置中心：图形化片段库（搜索/新建/复制/删除/快速编辑）、全部输入行为与全局热键、WebDAV 同步与备份
 - 模板变量：{date}、{time}、{datetime}、{clipboard}、{user}、{host}
 - WebDAV 同步：内容哈希判冲突，本地优先 + 远端备份；密码用 DPAPI 加密保存，不随配置同步
 - 单实例、托盘气泡、日志轮转、配置热重载、配置原子写
@@ -57,7 +57,7 @@
 ### 目录
 
     crates/vibekey-core/       平台无关：config / keymap / expand / sync / secret / state
-    crates/vibekey-win/        Win32 前端：app / hook / inject / sync / secret / autostart / log / util + ui/{tray,menu,popup,settings}
+    crates/vibekey-win/        Win32 前端：app / hook / inject / sync / secret / autostart / log / util + ui/{tray,menu,popup,settings,theme}
     docs/                      设计、Win7 构建、配置、WebDAV、测试清单
     scripts/                   Linux 交叉编译/打包/校验脚本（bash）
     assets/config.example.toml 完整示例配置
@@ -219,8 +219,9 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 | win::inject | 注入工作线程：等 Alt 松开、菜单模式处理、剪贴板粘贴或 Unicode 输入 |
 | win::ui::tray | 托盘图标（嵌入 ICO）、气泡、TaskbarCreated 重建 |
 | win::ui::menu | TrackPopupMenu 配置菜单 |
-| win::ui::popup | 片段列表弹窗（ListBox 子类化） |
-| win::ui::settings | 程序化创建的设置窗口 |
+| win::ui::popup | 可搜索的片段弹窗、自绘列表、F2/右键快速编辑（ListBox/Edit 子类化） |
+| win::ui::settings | 三页设置中心与完整图形化片段编辑器；工作副本校验后原子保存 |
+| win::ui::theme | 共享中文字体、配色、画刷和 GDI 绘图工具 |
 | win::sync | 同步后台线程（mpsc + recv_timeout） |
 | win::secret / autostart / log / util | DPAPI、注册表 Run、日志、Win32 小工具 |
 
@@ -274,7 +275,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 - [ ] 检查菜单模式检测的 30ms/40ms 沉降时序：可改成轮询 GUI_INMENUMODE 直到超时，减少极端时序漏判
 - [ ] AttachThreadInput 失败时列表只能鼠标操作：可增加托盘气泡提示或在 show 后再次重试激活
 - [ ] App 严格别名 caveat（app.rs 顶部注释）：彻底修需要内部可变性 + 重入队列重构
-- [ ] 设置窗口无法“清除已保存密码”（留空=不修改）；可加“清除密码”按钮
+- [x] 设置窗口已加入“清除已保存密码”（2026-11-09；点击后仅在应用时清除，取消不影响原密码）
 - [ ] UIPI 查询失败（返回 None）时按不可确认处理；可优化提示
 - [ ] 非文本剪贴板时改逐字输入，长文本较慢；如需更快可考虑 OLE IDataObject 完整快照（复杂，谨慎）
 - [ ] 菜单 owner 是隐藏窗口，极端前台锁场景下菜单可能需点击空白才消失（实测确认）
@@ -284,7 +285,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 
 ### P2：可选增强
 
-- [ ] 图形化片段编辑器（当前是 TOML + 设置窗口）
+- [x] 图形化片段编辑器与弹窗快速编辑（2026-11-09；仍可用 TOML，使用说明见 README 和 docs/testing.md）
 - [ ] 同步支持双向合并（当前本地优先 + 备份）
 - [ ] 安装包/自更新/多语言
 - [ ] 更多 core 单元测试（keymap 边界、同步状态机异常路径）

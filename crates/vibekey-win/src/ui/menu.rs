@@ -18,6 +18,7 @@ pub const CMD_AUTOSTART: u32 = 6;
 pub const CMD_OPEN_LOG: u32 = 7;
 pub const CMD_ABOUT: u32 = 8;
 pub const CMD_EXIT: u32 = 9;
+pub const CMD_NEW_SNIPPET: u32 = 10;
 
 /// State that influences the menu entries.
 pub struct MenuState {
@@ -35,22 +36,25 @@ pub fn show(hwnd: HWND, point: POINT, state: &MenuState) -> Option<u32> {
         if menu.is_null() {
             return None;
         }
-        append(menu, MF_STRING, CMD_LIST, "片段列表...");
-        append(menu, MF_STRING, CMD_EDIT_CONFIG, "编辑配置文件");
+        append(menu, MF_STRING, CMD_LIST, "片段列表…");
+        append(menu, MF_STRING, CMD_NEW_SNIPPET, "新建片段…");
+        append(menu, MF_STRING, CMD_SETTINGS, "设置与片段管理…");
+        append(menu, MF_SEPARATOR, 0, "");
+        append(menu, MF_STRING, CMD_EDIT_CONFIG, "编辑 TOML 配置");
         append(menu, MF_STRING, CMD_RELOAD, "重新加载配置");
         let mut sync_flags = MF_STRING;
         if !state.sync_available || state.syncing {
             sync_flags |= MF_GRAYED;
         }
         append(menu, sync_flags, CMD_SYNC, "立即同步");
-        append(menu, MF_STRING, CMD_SETTINGS, "WebDAV 设置...");
+        append(menu, MF_SEPARATOR, 0, "");
         let mut autostart_flags = MF_STRING;
         if state.autostart {
             autostart_flags |= MF_CHECKED;
         }
         append(menu, autostart_flags, CMD_AUTOSTART, "开机启动");
         append(menu, MF_STRING, CMD_OPEN_LOG, "打开日志文件");
-        append(menu, MF_STRING, CMD_ABOUT, "关于");
+        append(menu, MF_STRING, CMD_ABOUT, "关于 Vibekey");
         append(menu, MF_SEPARATOR, 0, "");
         append(menu, MF_STRING, CMD_EXIT, "退出");
 

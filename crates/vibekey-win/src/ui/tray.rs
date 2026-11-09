@@ -16,7 +16,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::util::{write_wide_field, WM_APP_TRAY};
 
 const TRAY_ID: u32 = 1;
-const TOOLTIP: &str = "Vibekey - Alt+反引号打开列表";
+const TOOLTIP: &str = "Vibekey · Alt+反引号打开片段 · 双击管理";
 const INFO_TITLE: &str = "Vibekey";
 const BALLOON_TIMEOUT_MS: u32 = 8000;
 

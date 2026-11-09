@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use vibekey_core::{Config, Keymap, Snippet};
+use vibekey_core::{Config, Keymap};
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
@@ -47,7 +47,7 @@ use crate::inject::{self, InjectHandle, InjectJob};
 use crate::secret::DpapiSecretStore;
 use crate::sync::{self, SyncHandle, SyncSettings};
 use crate::ui::menu::{self, MenuState};
-use crate::ui::popup::Popup;
+use crate::ui::popup::{Popup, PopupItem};
 use crate::ui::settings;
 use crate::ui::tray::Tray;
 use crate::util::{
@@ -108,7 +108,22 @@ pub unsafe fn try_app_mut<'a>() -> Option<&'a mut App> {
 /// Create the mutex used for single instance detection. Returns the handle and
 /// whether another instance already owns the mutex.
 fn acquire_instance_mutex() -> (HANDLE, bool) {
-    let name = wide("Local\\Vibekey.SingleInstance");
+    // Debug UI tests may opt into an isolated instance so they never stop or
+    // impersonate the user's running release. Release builds always use the
+    // fixed production mutex name.
+    #[cfg(debug_assertions)]
+    let mutex_name = std::env::var("VIBEKEY_DEBUG_INSTANCE")
+        .ok()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 40
+                && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        .map(|value| format!("Local\\Vibekey.SingleInstance.Debug.{value}"))
+        .unwrap_or_else(|| "Local\\Vibekey.SingleInstance".to_string());
+    #[cfg(not(debug_assertions))]
+    let mutex_name = "Local\\Vibekey.SingleInstance".to_string();
+    let name = wide(&mutex_name);
     // SAFETY: the name is a valid NUL terminated string; a null security
     // attribute pointer means the default descriptor.
     let mutex = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
@@ -447,22 +462,19 @@ impl App {
             self.popup.hide();
             return;
         }
-        let items: Vec<usize> = self
+        let items: Vec<PopupItem> = self
             .config
             .snippet
             .iter()
             .enumerate()
             .filter(|(_, snippet)| snippet.enabled)
-            .map(|(index, _)| index)
+            .map(|(index, snippet)| PopupItem::from_snippet(index, snippet))
             .collect();
         if items.is_empty() {
-            self.notify_always("没有可用的片段", true);
+            self.notify_always("还没有可用片段，请先创建一个", false);
+            self.open_snippet_editor(None);
             return;
         }
-        let texts: Vec<String> = items
-            .iter()
-            .map(|&index| snippet_display_text(&self.config.snippet[index]))
-            .collect();
         let mut target = std::ptr::null_mut();
         // SAFETY: IsWindow accepts any handle and only reads.
         if !hint.is_null()
@@ -475,7 +487,7 @@ impl App {
         if target.is_null() {
             target = self.injection_target();
         }
-        if !self.popup.show(self.hwnd, items, &texts, target) {
+        if !self.popup.show(self.hwnd, items, target) {
             self.notify("popup", "无法打开片段列表", true);
         }
     }
@@ -514,6 +526,7 @@ impl App {
     fn handle_menu_command(&mut self, command: u32) {
         match command {
             menu::CMD_LIST => self.open_list(),
+            menu::CMD_NEW_SNIPPET => self.open_snippet_editor(None),
             menu::CMD_EDIT_CONFIG => {
                 let path = self.config_path.clone();
                 self.open_in_editor(&path);
@@ -586,6 +599,37 @@ impl App {
             Arc::clone(&self.secrets),
         )
         .unwrap_or(std::ptr::null_mut());
+    }
+
+    /// Open the snippet page directly at an existing item, or create a new one.
+    /// This is used by F2/right-click in the picker and by the tray menu.
+    pub fn open_snippet_editor(&mut self, index: Option<usize>) {
+        self.popup.hide();
+        // The settings window owns a working copy which may have unsaved
+        // insertions/deletions. Carry the selected value as well as its index
+        // so the editor can resolve identity instead of trusting two snapshots
+        // to have identical positions.
+        let expected = index
+            .and_then(|value| self.config.snippet.get(value))
+            .cloned();
+        if index.is_some() && expected.is_none() {
+            self.notify("editor", "该片段已不存在，请刷新列表后重试", true);
+            return;
+        }
+        // SAFETY: IsWindow accepts any handle.
+        if !self.settings.is_null() && unsafe { IsWindow(self.settings) } != 0 {
+            settings::show_snippet_editor(self.settings, index, expected.as_ref());
+            // SAFETY: the settings handle was just verified live.
+            unsafe {
+                SetForegroundWindow(self.settings);
+            }
+            return;
+        }
+        self.open_settings();
+        // SAFETY: open_settings either stores a live handle or null.
+        if !self.settings.is_null() && unsafe { IsWindow(self.settings) } != 0 {
+            settings::show_snippet_editor(self.settings, index, expected.as_ref());
+        }
     }
 
     fn show_about(&self) {
@@ -904,21 +948,4 @@ fn usable_foreground_window() -> HWND {
     } else {
         foreground
     }
-}
-
-/// List box label: "1. 名称 — 首行预览", "-." for snippets without a hotkey.
-fn snippet_display_text(snippet: &Snippet) -> String {
-    let key = if snippet.key.trim().is_empty() {
-        "-".to_string()
-    } else {
-        snippet.key.trim().to_string()
-    };
-    let name = if snippet.name.trim().is_empty() {
-        "（无名称）".to_string()
-    } else {
-        snippet.name.trim().to_string()
-    };
-    let first_line = snippet.text.lines().next().unwrap_or("").replace('\t', " ");
-    let preview: String = first_line.chars().take(40).collect();
-    format!("{key}. {name} — {preview}")
 }

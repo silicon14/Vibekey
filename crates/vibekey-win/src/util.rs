@@ -37,6 +37,9 @@ pub const WM_APP_SYNC_DONE: u32 = WM_APP + 5;
 pub const WM_APP_INJECT_DONE: u32 = WM_APP + 6;
 /// The "test connection" worker finished; the result is in the settings state.
 pub const WM_APP_TEST_RESULT: u32 = WM_APP + 7;
+/// Select the snippet page and open an entry for quick editing.
+/// wparam = Config snippet index + 1; zero creates a new snippet.
+pub const WM_APP_SHOW_SNIPPET: u32 = WM_APP + 8;
 
 pub const ACTION_LIST: usize = 1;
 pub const ACTION_CONFIG: usize = 2;
@@ -162,36 +165,41 @@ pub fn mouse_pos() -> POINT {
     }
 }
 
-/// Move point so that a window of width x height around it stays on the monitor
-/// that contains the point.
-pub fn clamp_to_monitor(point: POINT, width: i32, height: i32) -> POINT {
+/// Work area of the monitor nearest to a point, with a primary-screen fallback.
+pub fn monitor_work_area(point: POINT) -> RECT {
     // SAFETY: the monitor info structure is initialised with its size and the
     // handle comes from the OS.
     unsafe {
         let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
         let mut info: MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        let (left, top, right, bottom) =
-            if !monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0 {
-                (
-                    info.rcWork.left,
-                    info.rcWork.top,
-                    info.rcWork.right,
-                    info.rcWork.bottom,
-                )
-            } else {
-                (
-                    0,
-                    0,
-                    GetSystemMetrics(SM_CXSCREEN),
-                    GetSystemMetrics(SM_CYSCREEN),
-                )
-            };
-        let margin = scale(4);
-        let x = point.x.min(right - width - margin).max(left + margin);
-        let y = point.y.min(bottom - height - margin).max(top + margin);
-        POINT { x, y }
+        if !monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0 {
+            info.rcWork
+        } else {
+            rect(
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+            )
+        }
     }
+}
+
+/// Move point so that a window of width x height around it stays on the monitor
+/// that contains the point.
+pub fn clamp_to_monitor(point: POINT, width: i32, height: i32) -> POINT {
+    let work = monitor_work_area(point);
+    let margin = scale(4);
+    let x = point
+        .x
+        .min(work.right - width - margin)
+        .max(work.left + margin);
+    let y = point
+        .y
+        .min(work.bottom - height - margin)
+        .max(work.top + margin);
+    POINT { x, y }
 }
 
 /// Try to make hwnd the foreground window.
