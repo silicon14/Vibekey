@@ -128,10 +128,13 @@ GetGUIThreadInfo 的 rcCaret → ClientToScreen，失败回退 GetCursorPos）�
 
 ### ui/popup.rs（片段列表）
 
-- 自绘窗口类 "VibekeyPopup"：WS_POPUP，WS_EX_TOPMOST|WS_EX_TOOLWINDOW；共享 ui::theme 的浅色配色和中文字体。
+- 自绘窗口类 "VibekeyPopup"：WS_POPUP，WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED；共享 ui::theme 的浅色配色和中文字体。
+- SetLayeredWindowAttributes(LWA_ALPHA) 使用 242/255（约 95%）统一不透明度，不引入 GPU/UI 框架；失败时移除
+  WS_EX_LAYERED 并回退为不透明。该 API 与 32 位 extended style 读写均兼容 Win7 x86/x64。
 - 顶部为标题和搜索 EDIT（EM_SETCUEBANNER），按名称、快捷键或内容预览过滤；中间是 LBS_OWNERDRAWFIXED ListBox，
   每行显示 Alt 槽位徽标、名称和首行预览；底部显示结果数、“新建片段”和“编辑所选(F2)”。
-- 尺寸约 600 逻辑像素宽、最大约 600 高，所有控件按 DPI 和 WM_SIZE 重排；宽高先按当前显示器工作区限制，再优先插入符定位，超出部分由列表滚动承载。
+- 尺寸约 480 逻辑像素宽、最大约 390 高，行高 44、最多 6 行；标题、搜索框和底栏同步压缩。所有控件按 DPI 和
+  WM_SIZE 重排；宽高先按当前显示器工作区限制，再优先插入符定位，超出部分由列表滚动承载。
 - 鼠标命中同时校验 LB_ITEMFROMPOINT 与 LB_GETITEMRECT，过滤后点击末行以下的空白不得执行最近一项。
 - 显示后 force_foreground + SetFocus，保留原来的目标窗口记录与失焦关闭行为。
 - 交互：Enter / 单击 / 双击条目 → 隐藏弹窗并注入；Esc → 关闭；F2 / 右键 / 编辑按钮 →

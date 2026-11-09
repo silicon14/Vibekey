@@ -16,8 +16,10 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
-    GetSystemMetrics, GetWindowThreadProcessId, MessageBoxW, SetForegroundWindow, GUITHREADINFO,
+    GetSystemMetrics, GetWindowLongW, GetWindowThreadProcessId, MessageBoxW, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetWindowLongW, GUITHREADINFO, GWL_EXSTYLE, LWA_ALPHA,
     MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
+    WS_EX_LAYERED,
 };
 
 /// First message id available to applications.
@@ -125,6 +127,30 @@ pub fn dpi_scale() -> f32 {
 /// Scale a logical pixel value to physical pixels.
 pub fn scale(value: i32) -> i32 {
     (value as f32 * dpi_scale()).round() as i32
+}
+
+/// Apply uniform alpha to a layered top-level window. If the platform rejects
+/// it, remove WS_EX_LAYERED so the window falls back to normal opaque drawing.
+/// SetLayeredWindowAttributes and the 32-bit style APIs exist on Windows 7 and
+/// work for both 32- and 64-bit processes (no pointer-sized value is involved).
+pub fn set_window_alpha(hwnd: HWND, alpha: u8) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    // SAFETY: hwnd is a live top-level window created with WS_EX_LAYERED;
+    // LWA_ALPHA reads only the supplied byte value.
+    let applied = unsafe { SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA) } != 0;
+    if !applied {
+        // SAFETY: extended styles are 32-bit values on both architectures.
+        // Preserve every other style bit while removing the unsupported layer.
+        unsafe {
+            let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            if style != 0 {
+                SetWindowLongW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED as i32));
+            }
+        }
+    }
+    applied
 }
 
 /// Position of the text caret of the foreground window, falling back to the

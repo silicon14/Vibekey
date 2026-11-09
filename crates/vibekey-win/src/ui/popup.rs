@@ -40,13 +40,14 @@ const COUNT_ID: i32 = 104;
 const NEW_BUTTON_ID: i32 = 110;
 const EDIT_BUTTON_ID: i32 = 111;
 
-const WIDTH_LOGICAL: i32 = 600;
-const MAX_HEIGHT_LOGICAL: i32 = 600;
-const ITEM_HEIGHT_LOGICAL: i32 = 56;
-const MAX_VISIBLE_ROWS: usize = 8;
-const LIST_TOP_LOGICAL: i32 = 96;
-const LIST_CHROME_LOGICAL: i32 = 152;
-const PREVIEW_CHARS: usize = 48;
+const WIDTH_LOGICAL: i32 = 480;
+const MAX_HEIGHT_LOGICAL: i32 = 390;
+const ITEM_HEIGHT_LOGICAL: i32 = 44;
+const MAX_VISIBLE_ROWS: usize = 6;
+const LIST_TOP_LOGICAL: i32 = 82;
+const LIST_CHROME_LOGICAL: i32 = 126;
+const PREVIEW_CHARS: usize = 40;
+const POPUP_ALPHA: u8 = 242;
 
 // Static-control styles from WinUser.h.  Defining these two values locally
 // avoids enabling another windows-sys feature solely for style constants.
@@ -180,8 +181,8 @@ impl Popup {
         let wanted_height =
             util::scale(LIST_CHROME_LOGICAL) + rows * util::scale(ITEM_HEIGHT_LOGICAL);
         // Limit both dimensions before positioning. On high-DPI displays the
-        // logical 600px design can otherwise be taller than the physical work
-        // area, putting the edit/new buttons off screen.
+        // logical design can otherwise be taller than the physical work area,
+        // putting the edit/new buttons off screen.
         let height = wanted_height
             .min(util::scale(MAX_HEIGHT_LOGICAL))
             .min((work_height - util::scale(8)).max(util::scale(1)));
@@ -326,7 +327,7 @@ impl Popup {
         // for the call.  WS_POPUP deliberately has no system WS_BORDER.
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
                 class.as_ptr(),
                 title.as_ptr(),
                 WS_POPUP | WS_CLIPCHILDREN,
@@ -344,6 +345,11 @@ impl Popup {
             return Err("CreateWindowExW failed".to_string());
         }
         self.hwnd = hwnd;
+        if !util::set_window_alpha(hwnd, POPUP_ALPHA) {
+            // The helper already removed WS_EX_LAYERED. Keep using the normal
+            // opaque window rather than losing the picker on older systems.
+            log::warn!("popup transparency is unavailable; using opaque drawing");
+        }
 
         self.controls.title = create_control(
             hwnd,
@@ -439,7 +445,7 @@ impl Popup {
             return Err("could not create one or more popup controls".to_string());
         }
 
-        theme::set_font(controls.title, theme::title_font());
+        theme::set_font(controls.title, theme::semibold_font());
         theme::set_font(controls.search, theme::body_font());
         theme::set_font(controls.empty, theme::body_font());
         theme::set_font(controls.count, theme::small_font());
@@ -722,11 +728,11 @@ fn layout_controls(hwnd: HWND, width: i32, height: i32) {
     if width <= 0 || height <= 0 {
         return;
     }
-    let margin = util::scale(16);
-    let search_top = util::scale(50);
-    let search_height = util::scale(36);
+    let margin = util::scale(14);
+    let search_top = util::scale(44);
+    let search_height = util::scale(30);
     let list_top = util::scale(LIST_TOP_LOGICAL);
-    let footer_height = util::scale(56);
+    let footer_height = util::scale(44);
     let list_height = (height - list_top - footer_height).max(util::scale(ITEM_HEIGHT_LOGICAL));
     let content_width = (width - 2 * margin).max(0);
 
@@ -734,17 +740,17 @@ fn layout_controls(hwnd: HWND, width: i32, height: i32) {
         hwnd,
         TITLE_ID,
         margin,
-        util::scale(12),
+        util::scale(8),
         content_width,
-        util::scale(30),
+        util::scale(26),
     );
     move_control(
         hwnd,
         SEARCH_ID,
         margin + util::scale(10),
-        search_top + util::scale(6),
+        search_top + util::scale(5),
         (content_width - 2 * util::scale(10)).max(0),
-        search_height - 2 * util::scale(6),
+        search_height - 2 * util::scale(5),
     );
     move_control(
         hwnd,
@@ -756,10 +762,10 @@ fn layout_controls(hwnd: HWND, width: i32, height: i32) {
     );
     move_control(hwnd, EMPTY_ID, margin, list_top, content_width, list_height);
 
-    let button_height = util::scale(30);
-    let button_y = height - util::scale(42);
-    let new_width = util::scale(100);
-    let edit_width = util::scale(120);
+    let button_height = util::scale(26);
+    let button_y = height - util::scale(34);
+    let new_width = util::scale(88);
+    let edit_width = util::scale(108);
     let button_gap = util::scale(8);
     let edit_x = width - margin - edit_width;
     let new_x = edit_x - button_gap - new_width;
@@ -783,9 +789,9 @@ fn layout_controls(hwnd: HWND, width: i32, height: i32) {
         hwnd,
         COUNT_ID,
         margin,
-        height - util::scale(39),
+        height - util::scale(32),
         (new_x - margin - util::scale(12)).max(0),
-        util::scale(24),
+        util::scale(22),
     );
 }
 
@@ -816,12 +822,12 @@ fn paint_popup(hwnd: HWND) {
         GetClientRect(hwnd, &mut client);
         theme::fill(hdc, &client, theme::SURFACE);
 
-        let margin = util::scale(16);
+        let margin = util::scale(14);
         let search_frame = util::rect(
             margin,
-            util::scale(50),
+            util::scale(44),
             client.right - margin,
-            util::scale(86),
+            util::scale(74),
         );
         let search = GetDlgItem(hwnd, SEARCH_ID);
         let focused = !search.is_null() && GetFocus() == search;
@@ -844,7 +850,7 @@ fn paint_popup(hwnd: HWND) {
         );
         theme::fill_rounded(hdc, &inner, util::scale(7), theme::SURFACE);
 
-        let separator_y = client.bottom - util::scale(56);
+        let separator_y = client.bottom - util::scale(44);
         let separator = util::rect(margin, separator_y, client.right - margin, separator_y + 1);
         theme::fill(hdc, &separator, theme::BORDER);
 
@@ -885,10 +891,10 @@ fn draw_list_item(draw: &DRAWITEMSTRUCT) {
     }
 
     let chip = util::rect(
-        row.left + util::scale(10),
-        row.top + util::scale(15),
-        row.left + util::scale(80),
-        row.top + util::scale(41),
+        row.left + util::scale(8),
+        row.top + util::scale(11),
+        row.left + util::scale(68),
+        row.top + util::scale(33),
     );
     theme::fill_rounded(
         draw.hDC,
@@ -916,22 +922,22 @@ fn draw_list_item(draw: &DRAWITEMSTRUCT) {
         },
     );
 
-    let text_left = row.left + util::scale(92);
-    let text_right = row.right - util::scale(12);
+    let text_left = row.left + util::scale(78);
+    let text_right = row.right - util::scale(10);
     if text_right <= text_left {
         return;
     }
     let name_rect = util::rect(
         text_left,
-        row.top + util::scale(6),
+        row.top + util::scale(3),
         text_right,
-        row.top + util::scale(28),
+        row.top + util::scale(21),
     );
     let preview_rect = util::rect(
         text_left,
-        row.top + util::scale(30),
+        row.top + util::scale(23),
         text_right,
-        row.top + util::scale(50),
+        row.top + util::scale(41),
     );
     theme::text(
         draw.hDC,

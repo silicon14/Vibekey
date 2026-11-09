@@ -67,6 +67,18 @@ SendInput(KEYEVENTF_UNICODE) 逐字符输入；打不开剪贴板时同样保守
 
 片段控件先修改窗口内的 Config 工作副本；只有“应用”或“保存并关闭”才统一校验 Keymap、检查文件外部修改并原子写入。取消不会写入半成品。应用后通过 WM_APP_RELOAD 复用既有热重载路径，因此钩子、同步线程和弹窗不会各自维护一份配置。界面共享 ui::theme 的字体、颜色和自绘列表，不增加 GUI 依赖或 Win8+ API。
 
+### 4.2 GPUI 评估与轻量透明弹窗（2026-11-09）
+
+评估了 [GPUI 0.2/pre-1.0](https://github.com/zed-industries/zed/tree/main/crates/gpui)：其
+[WindowBackgroundAppearance](https://docs.rs/gpui/latest/gpui/enum.WindowBackgroundAppearance.html) 提供 Transparent/Blurred，
+声明式 UI 也有吸引力。但当前 [Windows 后端](https://github.com/zed-industries/zed/blob/main/crates/gpui_windows/Cargo.toml)
+依赖 DirectComposition、Direct Manipulation 等 Win8+ 技术，并要求最新 stable Rust 和较多 GPU/DirectWrite 依赖。
+这与 Vibekey 的 Win7 x86/x64、rust-version 1.77、便携小体积及无额外 GUI 框架约束冲突，因此不迁移到 GPUI。
+
+Alt+反引号弹窗改用 480×390 逻辑像素的紧凑设计（44 像素行高、最多 6 行）。透明效果使用 Win7 已存在的
+WS_EX_LAYERED + SetLayeredWindowAttributes，242/255 统一 Alpha；不支持时移除分层样式并保持不透明。
+这是半透明而非背景模糊，优先保证中文、快捷键和小字的可读性。
+
 ### 5. 密码与同步
 
 WebDAV 密码不写入 config.toml：Windows 上用 DPAPI 加密后存放在 %APPDATA%\Vibekey\secret.bin，
