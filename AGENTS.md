@@ -22,6 +22,7 @@
   3. 发现问题后按本文件第 8 节的流程修改、测试、提交。
 - **产物**：dist/ 下是 Linux 交叉编译出的 Win7 发布版（便携单文件），可直接在 Win7 SP1 上试。
 - **技术栈**：Rust + windows-sys 0.59（裸 Win32 API）+ ureq/rustls。没有 electron/tauri/egui/WebView2/OpenGL 依赖。
+  `vibekey-win/build.rs` 用 embed-resource 2.5.2 嵌入 exe 图标和版本信息（只构建期依赖，不增加运行库）。
 - **Win7 兼容的关键**：普通 Rust 目标的预编译 std 要求 Windows 10，本项目用 tier-3 的
   x86_64-win7-windows-msvc / i686-win7-windows-msvc 目标 + nightly 的 -Z build-std 构建 Win7 版本。
   细节见 docs/win7.md。

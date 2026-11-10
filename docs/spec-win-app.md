@@ -14,8 +14,10 @@
 
 ## 模块与职责
 
-### main.rs
+### build.rs / main.rs
 
+- build.rs 将 assets/icon.ico 和中文 FileDescription、ProductName、Cargo 版本写入生成的 RC，再用 embed-resource 链接到 exe。
+  资源只用于装饰，交叉工具链缺少资源编译器时不得阻断功能程序构建；Cargo.toml / icon 变化需触发重建。
 - 设 DPI aware（SetProcessDPIAware）。
 - 单实例：CreateMutexW("Local\\Vibekey.SingleInstance")；已存在则直接退出。
 - 初始化日志，加载配置，创建隐藏主窗口，跑消息循环。

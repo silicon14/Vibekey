@@ -22,6 +22,7 @@ Vibekey 是给“高频重复输入”准备的：自我介绍、邮箱、地址
 - **WebDAV 同步与内容加密**：多台机器共用一份配置（Basic 认证）；可选 AES-256-GCM 加密和完整性认证，独立同步密码经 PBKDF2 派生密钥，HTTP 下也不直接暴露片段正文；冲突备份同样加密。两类密码分别用 Windows DPAPI 保存，不随配置同步。
 - **Windows 7 SP1 支持**：提供 32/64 位 Win7 专用产物；同样的 exe 也能在 Windows 10/11 上运行。
 - **单实例、文件日志、崩溃防护**：`%APPDATA%\Vibekey\` 下保存配置、日志和同步状态。
+- **应用图标与版本信息**：exe 内嵌蓝色 V 图标和中文文件说明，资源管理器、任务栏及文件属性中不再显示通用空白程序图标。
 
 ## 快捷键
 
@@ -279,6 +280,7 @@ Cargo.toml                  workspace（core + win 两个 crate）
 AGENTS.md                   开发/交接说明（在 Windows 上接手本项目时先读）
 crates/vibekey-core/        平台无关：配置 / 快捷键 / 模板展开 / 同步 / 状态 / 密码抽象
 crates/vibekey-win/         Win32 前端：托盘 / 键盘钩子 / 注入 / 列表 / 菜单 / 设置 / DPAPI / 同步线程
+crates/vibekey-win/build.rs 将 ICO、中文说明和 Cargo 版本嵌入 exe（embed-resource 仅构建期依赖）
 scripts/
   install-toolchain.sh      一次性安装 llvm-mingw + nightly/rust-src
   dev-env.sh                source 后设置交叉编译 PATH / CC / AR / 链接参数
