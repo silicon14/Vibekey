@@ -42,10 +42,13 @@ pub const WM_APP_TEST_RESULT: u32 = WM_APP + 7;
 /// Select the snippet page and open an entry for quick editing.
 /// wparam = Config snippet index + 1; zero creates a new snippet.
 pub const WM_APP_SHOW_SNIPPET: u32 = WM_APP + 8;
+/// Open the queued native menu after the caller's App borrow has ended.
+pub const WM_APP_SHOW_MENU: u32 = WM_APP + 9;
 
 pub const ACTION_LIST: usize = 1;
 pub const ACTION_CONFIG: usize = 2;
 pub const ACTION_SNIPPET: usize = 3;
+pub const ACTION_HISTORY: usize = 4;
 
 /// WM_TIMER id used to poll the configuration file for modifications.
 pub const TIMER_CONFIG_POLL: usize = 1;

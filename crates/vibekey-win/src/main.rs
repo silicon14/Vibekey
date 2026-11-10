@@ -14,6 +14,8 @@ mod autostart;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+mod history;
+#[cfg(windows)]
 mod hook;
 #[cfg(windows)]
 mod inject;

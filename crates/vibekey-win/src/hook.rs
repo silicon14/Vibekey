@@ -27,7 +27,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
 };
 
-use crate::util::{self, isize_to_hwnd, ACTION_CONFIG, ACTION_LIST, ACTION_SNIPPET, WM_APP_ACTION};
+use crate::util::{
+    self, isize_to_hwnd, ACTION_CONFIG, ACTION_HISTORY, ACTION_LIST, ACTION_SNIPPET, WM_APP_ACTION,
+};
 
 /// Configuration snapshot shared between the main thread and the hook thread.
 #[derive(Clone)]
@@ -392,6 +394,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     CONSUMED_VK.store(vk as u32, Ordering::Release);
     let action = match binding {
         Binding::List => ACTION_LIST,
+        Binding::History => ACTION_HISTORY,
         Binding::Config => ACTION_CONFIG,
         Binding::Snippet(index) => {
             shared.push_trigger(ACTION_SNIPPET, foreground);

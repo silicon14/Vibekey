@@ -19,8 +19,8 @@ hold_ms = 350
 #   "type"   用 SendInput 逐字符输入（适合不允许改动剪贴板的程序）
 input_method = "paste"
 
-# 粘贴后是否恢复剪贴板里原来的文本。只会恢复文本；原剪贴板中的图片、
-# 文件等会丢失，此时可设为 false 关闭恢复。
+# 粘贴后是否恢复剪贴板里原来的文本。只保存/恢复纯文本；检测到图片、文件
+# 或富文本时会自动改用逐字符输入，不覆盖原剪贴板。
 restore_clipboard = true
 
 # 开机自动启动（写入 HKCU\Software\Microsoft\Windows\CurrentVersion\Run）。
@@ -37,6 +37,10 @@ list = "alt+`"
 
 # 打开配置菜单的快捷键，默认 Alt + Backspace。
 config = "alt+backspace"
+
+# 打开文本剪贴板历史，默认 Alt + V，不占用 Windows 10/11 的系统 Win+V。
+# 历史只保留最近 50 条文本，存于内存并在退出时清空，不写入此配置文件。
+history = "alt+v"
 
 [sync]
 # 是否启用 WebDAV 同步。密码不在本文件里：保存时由 Windows DPAPI 加密到

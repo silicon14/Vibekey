@@ -18,8 +18,8 @@
 //! cached reference, and no handler stores a raw `*mut App` between calls.
 //!
 //! Known residual caveat: a few handlers still hold their `&mut App` while they
-//! call a pumping API (the tray/menu command dispatch through TrackPopupMenu, the
-//! "about" and settings validation dialogs through MessageBoxW). This is a
+//! call a pumping API (the "about" and settings validation dialogs through
+//! MessageBoxW). Native menus are queued through WM_APP_SHOW_MENU instead. This is a
 //! single threaded program and the handlers are written to be re-entrant, but
 //! strictly speaking Rust's aliasing rules are only fully satisfied by an
 //! interior mutability refactor (`RefCell`/`Cell` state) that is out of scope
@@ -36,28 +36,37 @@ use vibekey_core::{Config, Keymap};
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
+use windows_sys::Win32::System::DataExchange::{
+    AddClipboardFormatListener, RemoveClipboardFormatListener,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::autostart;
+use crate::history::{ClipboardHistory, HistoryControl};
 use crate::hook::{self, HookConfig, HookHandle};
 use crate::inject::{self, InjectHandle, InjectJob};
 use crate::secret::DpapiSecretStore;
 use crate::sync::{self, SyncHandle, SyncSettings};
 use crate::ui::menu::{self, MenuState};
-use crate::ui::popup::{Popup, PopupItem};
+use crate::ui::popup::{PickerMode, Popup, PopupItem};
 use crate::ui::settings;
 use crate::ui::tray::Tray;
 use crate::util::{
-    self, hwnd_to_isize, wide, ACTION_CONFIG, ACTION_LIST, ACTION_SNIPPET, TIMER_CONFIG_POLL,
-    TIMER_TRAY_CLICK, WM_APP_ACTION, WM_APP_INJECT_DONE, WM_APP_RELOAD, WM_APP_SYNC_DONE,
-    WM_APP_SYNC_NOW, WM_APP_TRAY,
+    self, hwnd_to_isize, wide, ACTION_CONFIG, ACTION_HISTORY, ACTION_LIST, ACTION_SNIPPET,
+    TIMER_CONFIG_POLL, TIMER_TRAY_CLICK, WM_APP_ACTION, WM_APP_INJECT_DONE, WM_APP_RELOAD,
+    WM_APP_SHOW_MENU, WM_APP_SYNC_DONE, WM_APP_SYNC_NOW, WM_APP_TRAY,
 };
 
 /// Time window in which the same notification category is suppressed.
 const NOTIFY_SUPPRESS: Duration = Duration::from_secs(600);
+
+/// Populate deterministic history rows for the isolated debug UI harness. This
+/// message and handler are compiled out of every release build.
+#[cfg(debug_assertions)]
+const WM_APP_DEBUG_HISTORY: u32 = util::WM_APP + 20;
 
 /// Application state.
 pub struct App {
@@ -70,14 +79,21 @@ pub struct App {
     hook: Option<HookHandle>,
     inject: Option<InjectHandle>,
     sync: Option<SyncHandle>,
-    /// The snippet picker; messages of its window are handled in ui::popup.
+    /// The snippet/history picker; messages are handled in ui::popup.
     pub popup: Popup,
+    /// Newest-first, memory-only text clipboard history.
+    pub history: ClipboardHistory,
+    /// Coordinates history capture with clipboard writes on the inject worker.
+    history_control: Arc<HistoryControl>,
+    clipboard_listener: bool,
     /// Settings window handle, or null.
     pub settings: HWND,
     last_mtime: Option<SystemTime>,
     last_notify: HashMap<&'static str, Instant>,
     sync_in_progress: bool,
     taskbar_created: u32,
+    /// Screen position for the next WM_APP_SHOW_MENU message.
+    pending_menu_point: Option<POINT>,
     /// A tray single click is waiting for the double click time to pass.
     tray_click_pending: bool,
     /// The second click of a tray double click arrived; ignore its button up.
@@ -208,11 +224,15 @@ impl App {
             inject: None,
             sync: None,
             popup: Popup::new(),
+            history: ClipboardHistory::new(),
+            history_control: Arc::new(HistoryControl::new()),
+            clipboard_listener: false,
             settings: std::ptr::null_mut(),
             last_mtime: None,
             last_notify: HashMap::new(),
             sync_in_progress: false,
             taskbar_created: 0,
+            pending_menu_point: None,
             tray_click_pending: false,
             tray_double_click_seen: false,
             quitting: false,
@@ -285,7 +305,21 @@ impl App {
             }
         }
 
-        self.inject = Some(inject::start(self.hwnd));
+        self.inject = Some(inject::start(self.hwnd, Arc::clone(&self.history_control)));
+
+        // AddClipboardFormatListener is available on Windows 7. Notifications
+        // only read CF_UNICODETEXT; rich payloads and files are never cloned.
+        // SAFETY: the main window is live and belongs to this message-loop thread.
+        self.clipboard_listener = unsafe { AddClipboardFormatListener(self.hwnd) } != 0;
+        if self.clipboard_listener {
+            self.capture_clipboard();
+        } else {
+            self.notify(
+                "history-listener",
+                "无法监听剪贴板变化，历史记录暂不可用",
+                true,
+            );
+        }
 
         let sync = sync::start(self.hwnd, Arc::clone(&self.secrets));
         sync.update(SyncSettings::from_config(
@@ -415,6 +449,31 @@ impl App {
         }
     }
 
+    /// Capture one clipboard-update notification without sleeping on the UI
+    /// thread. Internal paste/restore updates are filtered by HistoryControl.
+    fn capture_clipboard(&mut self) {
+        if let Some(text) = self.history_control.capture_text() {
+            if self.history.record(text) {
+                log::debug!(
+                    "clipboard history now has {} entries",
+                    self.history.entries().count()
+                );
+            }
+        } else {
+            log::debug!("clipboard update was internal, locked, or contained no Unicode text");
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_seed_history(&mut self) {
+        if std::env::var_os("VIBEKEY_DEBUG_INSTANCE").is_none() {
+            return;
+        }
+        self.history.clear();
+        self.history.record("历史甲 第一行".to_string());
+        self.history.record("历史乙\r\n第二行 {date}".to_string());
+    }
+
     /// Queue a snippet for injection.
     ///
     /// The template is expanded on the inject worker thread, so the clipboard is
@@ -436,6 +495,7 @@ impl App {
         };
         let job = InjectJob {
             template,
+            expand_template: true,
             send_enter,
             target: hwnd_to_isize(target),
             input_method: self.config.input_method,
@@ -448,6 +508,37 @@ impl App {
             .unwrap_or(false);
         if !submitted {
             self.notify("inject", "无法启动输入线程，注入失败", true);
+        }
+    }
+
+    /// Paste one history entry verbatim. The stable ID is revalidated because a
+    /// newer copy or Delete may have changed the list while the popup was open.
+    pub fn inject_history(&mut self, id: u64, target: HWND) {
+        let Some(text) = self.history.text(id).map(str::to_owned) else {
+            self.notify("history-stale", "这条剪贴板历史已被删除", true);
+            return;
+        };
+        let target = if target.is_null() {
+            // SAFETY: GetForegroundWindow has no preconditions.
+            unsafe { GetForegroundWindow() }
+        } else {
+            target
+        };
+        let job = InjectJob {
+            template: text,
+            expand_template: false,
+            send_enter: false,
+            target: hwnd_to_isize(target),
+            input_method: self.config.input_method,
+            restore_clipboard: self.config.restore_clipboard,
+        };
+        let submitted = self
+            .inject
+            .as_ref()
+            .map(|handle| handle.submit(job))
+            .unwrap_or(false);
+        if !submitted {
+            self.notify("inject", "无法启动输入线程，粘贴历史失败", true);
         }
     }
 
@@ -475,21 +566,49 @@ impl App {
             self.open_snippet_editor(None);
             return;
         }
-        let mut target = std::ptr::null_mut();
+        let target = self.picker_target(hint);
+        if !self
+            .popup
+            .show(self.hwnd, PickerMode::Snippets, items, target)
+        {
+            self.notify("popup", "无法打开片段列表", true);
+        }
+    }
+
+    /// Open (or close) the memory-only text clipboard history.
+    pub fn open_history(&mut self) {
+        self.open_history_with_hint(std::ptr::null_mut());
+    }
+
+    fn open_history_with_hint(&mut self, hint: HWND) {
+        if self.popup.is_open() {
+            self.popup.hide();
+            return;
+        }
+        let items = self
+            .history
+            .entries()
+            .map(|entry| PopupItem::from_history(entry.id(), entry.text()))
+            .collect();
+        let target = self.picker_target(hint);
+        if !self
+            .popup
+            .show(self.hwnd, PickerMode::History, items, target)
+        {
+            self.notify("popup", "无法打开剪贴板历史", true);
+        }
+    }
+
+    fn picker_target(&self, hint: HWND) -> HWND {
         // SAFETY: IsWindow accepts any handle and only reads.
         if !hint.is_null()
             && unsafe { IsWindow(hint) } != 0
             && !util::is_our_process_window(hint)
             && !util::is_shell_surface(hint)
         {
-            target = hint;
+            return hint;
         }
-        if target.is_null() {
-            target = self.injection_target();
-        }
-        if !self.popup.show(self.hwnd, items, target) {
-            self.notify("popup", "无法打开片段列表", true);
-        }
+        self.injection_target()
     }
 
     /// Window that should receive the injection when the list is opened.
@@ -512,20 +631,25 @@ impl App {
         usable_foreground_window()
     }
 
-    fn show_menu(&mut self, point: POINT) {
-        let state = MenuState {
-            sync_available: self.config.sync.enabled,
-            syncing: self.sync_in_progress,
-            autostart: self.config.start_with_windows,
-        };
-        if let Some(command) = menu::show(self.hwnd, point, &state) {
-            self.handle_menu_command(command);
+    /// Queue a native menu instead of entering TrackPopupMenu while the caller
+    /// holds an App borrow. show_queued_menu reacquires state before/after the
+    /// pumping call, keeping nested window messages alias-safe.
+    pub(crate) fn queue_menu(&mut self, point: POINT) {
+        self.pending_menu_point = Some(point);
+        // SAFETY: the main window is live; posting never pumps nested messages.
+        unsafe {
+            PostMessageW(self.hwnd, WM_APP_SHOW_MENU, 0, 0);
         }
     }
 
     fn handle_menu_command(&mut self, command: u32) {
         match command {
             menu::CMD_LIST => self.open_list(),
+            menu::CMD_HISTORY => self.open_history(),
+            menu::CMD_CLEAR_HISTORY => {
+                self.history.clear();
+                self.notify_always("剪贴板历史已清空", false);
+            }
             menu::CMD_NEW_SNIPPET => self.open_snippet_editor(None),
             menu::CMD_EDIT_CONFIG => {
                 let path = self.config_path.clone();
@@ -635,17 +759,18 @@ impl App {
     fn show_about(&self) {
         let hotkeys = match self.keymap.as_ref() {
             Some(keymap) => format!(
-                "片段列表：{}\n配置菜单：{}",
+                "片段列表：{}\n剪贴板历史：{}\n配置菜单：{}",
                 keymap.list_hotkey().display(),
+                keymap.history_hotkey().display(),
                 keymap.config_hotkey().display()
             ),
             None => format!(
-                "片段列表：{}\n配置菜单：{}",
-                self.config.hotkeys.list, self.config.hotkeys.config
+                "片段列表：{}\n剪贴板历史：{}\n配置菜单：{}",
+                self.config.hotkeys.list, self.config.hotkeys.history, self.config.hotkeys.config
             ),
         };
         let text = format!(
-            "Vibekey {}\n\n{}\n\n配置文件：{}\n\n按住 Alt 按数字键即可插入片段；Alt+反引号打开片段列表。\n支持 Windows 7 SP1 及更新版本。",
+            "Vibekey {}\n\n{}\n\n配置文件：{}\n\n按住 Alt 按数字键即可插入片段；Alt+V 打开文本剪贴板历史。\n支持 Windows 7 SP1 及更新版本。",
             env!("CARGO_PKG_VERSION"),
             hotkeys,
             self.config_path.display()
@@ -706,9 +831,10 @@ impl App {
             .unwrap_or(std::ptr::null_mut());
         match action {
             ACTION_LIST => self.open_list_with_hint(trigger),
+            ACTION_HISTORY => self.open_history_with_hint(trigger),
             ACTION_CONFIG => {
                 let point = util::caret_pos();
-                self.show_menu(point);
+                self.queue_menu(point);
             }
             ACTION_SNIPPET => {
                 let target = if trigger.is_null() {
@@ -728,7 +854,7 @@ impl App {
         match event {
             WM_RBUTTONUP | WM_CONTEXTMENU => {
                 let point = util::mouse_pos();
-                self.show_menu(point);
+                self.queue_menu(point);
             }
             WM_LBUTTONUP => {
                 if self.tray_double_click_seen {
@@ -807,6 +933,15 @@ impl App {
             KillTimer(self.hwnd, TIMER_CONFIG_POLL);
             KillTimer(self.hwnd, TIMER_TRAY_CLICK);
         }
+        if self.clipboard_listener {
+            // SAFETY: this thread registered the listener for the still-live main
+            // window; removal prevents any further history messages during exit.
+            unsafe {
+                RemoveClipboardFormatListener(self.hwnd);
+            }
+            self.clipboard_listener = false;
+        }
+        self.history.clear();
         if let Some(mut tray) = self.tray.take() {
             tray.remove();
         }
@@ -839,11 +974,15 @@ fn message_loop(pointer: *mut App) -> i32 {
         if result == 0 || result == -1 {
             break;
         }
-        // SAFETY: short lived read of one field; only the main thread touches
-        // App and no reference is kept across the dispatch below.
-        let settings = unsafe { (*pointer).settings };
+        // SAFETY: short lived reads of window handles; only the main thread
+        // touches App and no reference is kept across the dispatch below.
+        let (main_hwnd, settings) = unsafe { ((*pointer).hwnd, (*pointer).settings) };
         let mut handled = false;
-        if !settings.is_null() && unsafe { IsWindow(settings) } != 0 {
+        // IsDialogMessageW is only for messages belonging to the settings
+        // dialog. Clipboard updates, tray callbacks and worker completions are
+        // addressed to the hidden main window and must never be consumed as
+        // dialog navigation while settings happens to be open.
+        if message.hwnd != main_hwnd && !settings.is_null() && unsafe { IsWindow(settings) } != 0 {
             // SAFETY: the message is valid and the window is live; the call only
             // reads the message structure. It may dispatch WM_COMMAND to the
             // settings window but never touches App directly.
@@ -861,12 +1000,49 @@ fn message_loop(pointer: *mut App) -> i32 {
     message.wParam as i32
 }
 
+/// Show a queued menu without holding an App reference across TrackPopupMenu.
+/// State is copied in one short borrow; command dispatch uses a fresh borrow.
+fn show_queued_menu() {
+    // SAFETY: called by the main window procedure on the App's main thread.
+    let request = unsafe { try_app_mut() }.and_then(|app| {
+        app.pending_menu_point.take().map(|point| {
+            (
+                app.hwnd,
+                point,
+                MenuState {
+                    sync_available: app.config.sync.enabled,
+                    syncing: app.sync_in_progress,
+                    autostart: app.config.start_with_windows,
+                    history_available: !app.history.is_empty(),
+                },
+            )
+        })
+    });
+    let Some((hwnd, point, state)) = request else {
+        return;
+    };
+    if let Some(command) = menu::show(hwnd, point, &state) {
+        // SAFETY: the modal menu has returned; nested messages are complete and
+        // the App may be reborrowed for the selected command.
+        if let Some(app) = unsafe { try_app_mut() } {
+            app.handle_menu_command(command);
+        }
+    }
+}
+
 unsafe extern "system" fn main_window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Handle this before the procedure's general App borrow. menu::show pumps
+    // messages, so no outer &mut App may remain alive during the call.
+    if message == WM_APP_SHOW_MENU {
+        show_queued_menu();
+        return 0;
+    }
+
     // SAFETY: window procedures only run on the main thread; during shutdown the
     // app may already be gone, in which case messages fall through to the
     // default handling.
@@ -884,6 +1060,15 @@ unsafe extern "system" fn main_window_proc(
     match message {
         WM_TIMER => {
             app.on_timer(wparam);
+            0
+        }
+        WM_CLIPBOARDUPDATE => {
+            app.capture_clipboard();
+            0
+        }
+        #[cfg(debug_assertions)]
+        WM_APP_DEBUG_HISTORY => {
+            app.debug_seed_history();
             0
         }
         WM_APP_ACTION => {

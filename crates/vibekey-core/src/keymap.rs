@@ -220,6 +220,8 @@ fn parse_key(token: &str) -> Result<Key, KeyError> {
 pub enum Binding {
     /// Open the selectable snippet list.
     List,
+    /// Open the text clipboard history.
+    History,
     /// Open the configuration menu.
     Config,
     /// Insert the snippet at this index in Config::snippet.
@@ -243,6 +245,7 @@ impl fmt::Display for KeymapError {
 pub struct Keymap {
     list: Hotkey,
     config: Hotkey,
+    history: Hotkey,
     slots: Vec<(Hotkey, usize)>,
     by_key: HashMap<Hotkey, Binding>,
 }
@@ -257,6 +260,10 @@ impl Keymap {
         });
         let config_hotkey = parse_hotkey(&config.hotkeys.config).map_err(|error| KeymapError {
             context: "hotkeys.config".to_string(),
+            error,
+        });
+        let history = parse_hotkey(&config.hotkeys.history).map_err(|error| KeymapError {
+            context: "hotkeys.history".to_string(),
             error,
         });
 
@@ -274,11 +281,32 @@ impl Keymap {
                 Hotkey::alt(Key::Backspace)
             }
         };
+        let history = match history {
+            Ok(hotkey) => hotkey,
+            Err(error) => {
+                errors.push(error);
+                Hotkey::alt(Key::Char('v'))
+            }
+        };
 
         let mut slots: Vec<(Hotkey, usize)> = Vec::new();
         let mut seen: HashMap<Hotkey, String> = HashMap::new();
         seen.insert(list, "hotkeys.list".to_string());
-        seen.insert(config_hotkey, "hotkeys.config".to_string());
+        for (hotkey, context) in [
+            (config_hotkey, "hotkeys.config"),
+            (history, "hotkeys.history"),
+        ] {
+            if let Some(existing) = seen.insert(hotkey, context.to_string()) {
+                errors.push(KeymapError {
+                    context: context.to_string(),
+                    error: KeyError::Duplicate(format!(
+                        "{} conflicts with {}",
+                        hotkey.display(),
+                        existing
+                    )),
+                });
+            }
+        }
 
         for (index, snippet) in config.snippet.iter().enumerate() {
             if !snippet.enabled || snippet.key.is_empty() {
@@ -316,6 +344,7 @@ impl Keymap {
         let mut by_key = HashMap::new();
         by_key.insert(list, Binding::List);
         by_key.insert(config_hotkey, Binding::Config);
+        by_key.insert(history, Binding::History);
         for (hotkey, index) in &slots {
             by_key.insert(*hotkey, Binding::Snippet(*index));
         }
@@ -323,6 +352,7 @@ impl Keymap {
         Ok(Self {
             list,
             config: config_hotkey,
+            history,
             slots,
             by_key,
         })
@@ -338,6 +368,10 @@ impl Keymap {
 
     pub fn config_hotkey(&self) -> Hotkey {
         self.config
+    }
+
+    pub fn history_hotkey(&self) -> Hotkey {
+        self.history
     }
 
     pub fn snippet_bindings(&self) -> &[(Hotkey, usize)] {
@@ -413,6 +447,11 @@ mod tests {
             Some(Binding::Config)
         );
         assert_eq!(
+            keymap.resolve(&Hotkey::alt(Key::Char('v'))),
+            Some(Binding::History)
+        );
+        assert_eq!(keymap.history_hotkey(), Hotkey::alt(Key::Char('v')));
+        assert_eq!(
             keymap.resolve(&Hotkey::alt(Key::Char('1'))),
             Some(Binding::Snippet(0))
         );
@@ -440,6 +479,16 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| matches!(e.error, KeyError::Duplicate(_))));
+    }
+
+    #[test]
+    fn built_in_hotkey_collisions_are_rejected() {
+        let mut config = Config::default();
+        config.hotkeys.history = config.hotkeys.list.clone();
+        let errors = Keymap::build(&config).unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.context == "hotkeys.history" && matches!(error.error, KeyError::Duplicate(_))
+        }));
     }
 
     #[test]

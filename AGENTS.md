@@ -8,14 +8,14 @@
 ## 0. 先看这里（TL;DR）
 
 - **项目是什么**：Vibekey 是一个常驻托盘的 Windows 小工具。按住 Alt 后按数字键，把预设文字直接输入当前窗口；
-  Alt+反引号打开片段列表，Alt+Backspace 打开配置菜单；配置是纯文本 TOML；支持 WebDAV 同步。
-- **当前状态**：功能已完整实现，源码在仓库里；core 有 37 个单元测试 + 9 个 WebDAV 集成测试全绿；
+  Alt+反引号打开单行片段列表，Alt+V 打开内存文本剪贴板历史，Alt+Backspace 打开配置菜单；配置是纯文本 TOML；支持 WebDAV 同步。
+- **当前状态**：功能已完整实现，源码在仓库里；core 有 38 个单元测试 + 9 个 WebDAV 集成测试全绿；
   Win7 x64/i686 的 exe 已用 Linux 交叉编译产出，PE 头/导入表已做静态校验。
 - **真机验证进度**（2026-11-06，Windows 11 26200 x64）：已确认启动 / 托盘图标 / 右键菜单 /
   双击设置窗口 / 单实例 / 退出 / 真键盘 Alt+1 插入全部正常，记录见 `docs/testing-win11-2026-11-06.md`。
   仍待验证：Alt+反引号列表、hold 模式、剪贴板恢复、管理员权限窗口、多显示器 DPI、Win7、中文输入法下插入。
 - **Windows 本机构建已跑通**（2026-11-06）：rustup stable 1.99.1 MSVC + VS Build Tools 18 + SDK 10.0.26100；
-  `cargo test -p vibekey-core` 37 unit + 9 integration 全绿，`cargo build -p vibekey` 约 10 秒出 debug exe。
+  `cargo test -p vibekey-core` 38 unit + 9 integration 全绿，`cargo build -p vibekey` 约 10 秒出 debug exe。
 - **在 Windows 上第一件事**：
   1. 用 stable MSVC 构建 debug 版（仅 Win10/11 跑）；
   2. 按 docs/testing.md 的 P0 清单逐项验证；
@@ -47,8 +47,9 @@
 ### 功能
 
 - Alt+1 … Alt+9、Alt+0、Alt+-、Alt+=：12 个槽位直接插入片段文字
-- Alt+反引号（1 左边那颗 · 键）：可搜索的片段列表（方向键/Enter/Esc/单击，F2/右键快速编辑）
-- Alt+Backspace 或右键托盘：配置菜单（列表、新建片段、设置、TOML、重载、同步、启动、日志、关于、退出）
+- Alt+反引号（1 左边那颗 · 键）：可搜索的单行片段列表（方向键/Enter/Esc/单击，F2/右键快速编辑，☰ 完整菜单）
+- Alt+V：类似 Win+V 的文本剪贴板历史（最近 50 条、搜索、Enter/单击粘贴、Delete、清空；仅内存，退出清空）
+- Alt+Backspace 或右键托盘：配置菜单（列表、历史、新建片段、设置、TOML、重载、同步、启动、日志、关于、退出）
 - 统一设置中心：图形化片段库（搜索/新建/复制/删除/快速编辑）、全部输入行为与全局热键、WebDAV 同步与备份
 - 模板变量：{date}、{time}、{datetime}、{clipboard}、{user}、{host}
 - WebDAV 同步：内容哈希判冲突，本地优先 + 远端备份；密码用 DPAPI 加密保存，不随配置同步
@@ -57,7 +58,7 @@
 ### 目录
 
     crates/vibekey-core/       平台无关：config / keymap / expand / sync / secret / state
-    crates/vibekey-win/        Win32 前端：app / hook / inject / sync / secret / autostart / log / util + ui/{tray,menu,popup,settings,theme}
+    crates/vibekey-win/        Win32 前端：app / history / hook / inject / sync / secret / autostart / log / util + ui/{tray,menu,popup,settings,theme}
     docs/                      设计、Win7 构建、配置、WebDAV、测试清单
     scripts/                   Linux 交叉编译/打包/校验脚本（bash）
     assets/config.example.toml 完整示例配置
@@ -163,7 +164,7 @@ Win7 目标（x86_64-win7-windows-msvc / i686-win7-windows-msvc）是 tier-3，�
 
 ### 4.1 自动测试
 
-    cargo test -p vibekey-core        # 37 unit + 9 integration（WebDAV 用 127.0.0.1 进程内 mock）
+    cargo test -p vibekey-core        # 38 unit + 9 integration（WebDAV 用 127.0.0.1 进程内 mock）
     cargo fmt --all -- --check
     cargo build -p vibekey            # Win10+ 本机
 
@@ -216,10 +217,11 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 | core::secret | 平台密码存储抽象（Windows 由 win 端用 DPAPI 实现） |
 | win::app | 单实例、隐藏主窗口、消息循环、托盘/菜单/弹窗/设置调度、热重载、退出 |
 | win::hook | 独立线程的 WH_KEYBOARD_LL 全局钩子、Alt 状态、hold 计时、吞键 |
-| win::inject | 注入工作线程：等 Alt 松开、菜单模式处理、剪贴板粘贴或 Unicode 输入 |
+| win::inject | 注入工作线程：等 Alt 松开、菜单模式处理、剪贴板粘贴或 Unicode 输入；内部写入经 HistoryControl 屏蔽 |
+| win::history | 最近 50 条内存文本历史、稳定 ID、去重；剪贴板互斥与 sequence 前后复核，不写磁盘 |
 | win::ui::tray | 托盘图标（嵌入 ICO）、气泡、TaskbarCreated 重建 |
 | win::ui::menu | TrackPopupMenu 配置菜单 |
-| win::ui::popup | 可搜索的片段弹窗、自绘列表、F2/右键快速编辑（ListBox/Edit 子类化） |
+| win::ui::popup | 片段/历史共用的单行自绘选择器、F2/右键编辑、Delete/清空历史（ListBox/Edit 子类化） |
 | win::ui::settings | 三页设置中心与完整图形化片段编辑器；工作副本校验后原子保存 |
 | win::ui::theme | 共享中文字体、配色、画刷和 GDI 绘图工具 |
 | win::sync | 同步后台线程（mpsc + recv_timeout） |
@@ -265,6 +267,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 - [x] Windows 11 x64：启动、托盘、右键菜单、设置窗口、单实例、退出、真键盘 Alt+1 插入（2026-11-06）
 - [ ] Win7 SP1 x64 / x86 上启动、托盘、Alt+数字、列表、配置菜单、设置窗口、同步全部按 testing.md 跑通
 - [ ] 菜单模式 / 前台激活 / 剪贴板 / hold 模式 / 自动重复这几处修复在真实程序（记事本、资源管理器、Office、微信、浏览器）中确认
+- [ ] 正常桌面里的真实复制 → Alt+V → 搜索/粘贴/Delete/清空、内部写入不污染历史、退出无历史文件（2026-11-10 自动化会话 OpenClipboard/clip.exe 均被 error 5 拒绝，debug 样本仅覆盖 UI）
 - [ ] 输入法为中文时插入是否正常
 - [ ] 管理员权限窗口、UIPI 行为
 - [ ] 多显示器 + 125%/150% DPI 下列表位置

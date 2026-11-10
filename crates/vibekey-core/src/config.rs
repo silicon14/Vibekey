@@ -39,7 +39,7 @@ pub enum InputMethod {
     Type,
 }
 
-/// Global hotkeys of the two built-in menus.
+/// Global hotkeys of the built-in pickers and configuration menu.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hotkeys {
@@ -47,6 +47,9 @@ pub struct Hotkeys {
     pub list: String,
     /// Opens the configuration menu. Default: Alt + Backspace.
     pub config: String,
+    /// Opens the text clipboard history. Default: Alt + V.  Alt is used instead
+    /// of Win so the Windows 10/11 clipboard panel keeps its native shortcut.
+    pub history: String,
 }
 
 impl Default for Hotkeys {
@@ -54,6 +57,7 @@ impl Default for Hotkeys {
         Self {
             list: "alt+\x60".to_string(),
             config: "alt+backspace".to_string(),
+            history: "alt+v".to_string(),
         }
     }
 }
@@ -300,6 +304,9 @@ impl Config {
         if self.hotkeys.config.trim().is_empty() {
             issues.push(Issue::error("hotkeys.config must not be empty"));
         }
+        if self.hotkeys.history.trim().is_empty() {
+            issues.push(Issue::error("hotkeys.history must not be empty"));
+        }
         if self.ignore_apps.iter().any(|name| name.trim().is_empty()) {
             issues.push(Issue::warning("ignore_apps contains an empty entry"));
         }
@@ -398,6 +405,7 @@ mod tests {
         assert_eq!(parsed.snippet.len(), config.snippet.len());
         assert_eq!(parsed.snippet[0].text, config.snippet[0].text);
         assert_eq!(parsed.hotkeys.list, Hotkeys::default().list);
+        assert_eq!(parsed.hotkeys.history, "alt+v");
         assert_eq!(parsed.activation, ActivationMode::Immediate);
     }
 

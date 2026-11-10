@@ -19,12 +19,15 @@ pub const CMD_OPEN_LOG: u32 = 7;
 pub const CMD_ABOUT: u32 = 8;
 pub const CMD_EXIT: u32 = 9;
 pub const CMD_NEW_SNIPPET: u32 = 10;
+pub const CMD_HISTORY: u32 = 11;
+pub const CMD_CLEAR_HISTORY: u32 = 12;
 
 /// State that influences the menu entries.
 pub struct MenuState {
     pub sync_available: bool,
     pub syncing: bool,
     pub autostart: bool,
+    pub history_available: bool,
 }
 
 /// Show the menu at the given screen position and return the selected command.
@@ -37,8 +40,21 @@ pub fn show(hwnd: HWND, point: POINT, state: &MenuState) -> Option<u32> {
             return None;
         }
         append(menu, MF_STRING, CMD_LIST, "片段列表…");
+        append(menu, MF_STRING, CMD_HISTORY, "剪贴板历史…");
         append(menu, MF_STRING, CMD_NEW_SNIPPET, "新建片段…");
         append(menu, MF_STRING, CMD_SETTINGS, "设置与片段管理…");
+        append(menu, MF_SEPARATOR, 0, "");
+        let clear_history_flags = if state.history_available {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
+        append(
+            menu,
+            clear_history_flags,
+            CMD_CLEAR_HISTORY,
+            "清空剪贴板历史",
+        );
         append(menu, MF_SEPARATOR, 0, "");
         append(menu, MF_STRING, CMD_EDIT_CONFIG, "编辑 TOML 配置");
         append(menu, MF_STRING, CMD_RELOAD, "重新加载配置");

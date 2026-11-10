@@ -80,6 +80,7 @@ const ID_RESTORE_CLIPBOARD: i32 = 504;
 const ID_LIST_HOTKEY: i32 = 505;
 const ID_CONFIG_HOTKEY: i32 = 506;
 const ID_IGNORE_APPS: i32 = 507;
+const ID_HISTORY_HOTKEY: i32 = 508;
 
 const ID_OPEN_CONFIG: i32 = 600;
 const ID_APPLY: i32 = 601;
@@ -136,6 +137,8 @@ struct BehaviorControls {
     list_hotkey: HWND,
     config_hotkey_label: HWND,
     config_hotkey: HWND,
+    history_hotkey_label: HWND,
+    history_hotkey: HWND,
     ignore_label: HWND,
     ignore_apps: HWND,
     ignore_hint: HWND,
@@ -629,6 +632,9 @@ unsafe fn create_behavior_controls(state: &mut SettingsState) {
     c.config_hotkey_label = small_label(page, "打开配置菜单", -1);
     c.config_hotkey = edit(page, &config.hotkeys.config, ID_CONFIG_HOTKEY, false);
     theme::set_font(c.config_hotkey, theme::mono_font());
+    c.history_hotkey_label = small_label(page, "打开剪贴板历史", -1);
+    c.history_hotkey = edit(page, &config.hotkeys.history, ID_HISTORY_HOTKEY, false);
+    theme::set_font(c.history_hotkey, theme::mono_font());
     c.ignore_label = small_label(page, "忽略程序（每行一个 exe 名称）", -1);
     c.ignore_apps = multiline_edit(page, &config.ignore_apps.join("\r\n"), ID_IGNORE_APPS);
     c.ignore_hint = small_label(
@@ -1009,7 +1015,7 @@ fn layout_snippets(state: &mut SettingsState, height: i32) {
 fn layout_behavior(state: &mut SettingsState, height: i32) {
     let c = &state.behavior;
     let width = page_width(state, PAGE_BEHAVIOR);
-    if height < util::scale(400) {
+    if height < util::scale(440) {
         layout_behavior_compact(c, width, height);
         return;
     }
@@ -1101,23 +1107,37 @@ fn layout_behavior(state: &mut SettingsState, height: i32) {
         util::scale(30),
     );
     move_window(
-        c.ignore_label,
+        c.history_hotkey_label,
         right,
         util::scale(182),
         column,
         util::scale(20),
     );
     move_window(
-        c.ignore_apps,
+        c.history_hotkey,
         right,
         util::scale(204),
         column,
-        util::scale(96),
+        util::scale(30),
+    );
+    move_window(
+        c.ignore_label,
+        right,
+        util::scale(246),
+        column,
+        util::scale(20),
+    );
+    move_window(
+        c.ignore_apps,
+        right,
+        util::scale(268),
+        column,
+        util::scale(88),
     );
     move_window(
         c.ignore_hint,
         right,
-        util::scale(312),
+        util::scale(366),
         column,
         util::scale(64),
     );
@@ -1221,25 +1241,39 @@ fn layout_behavior_compact(c: &BehaviorControls, width: i32, height: i32) {
         util::scale(28),
     );
     move_window(
-        c.ignore_label,
+        c.history_hotkey_label,
         right,
         util::scale(164),
         column,
         util::scale(18),
     );
     move_window(
-        c.ignore_apps,
+        c.history_hotkey,
         right,
         util::scale(184),
         column,
-        util::scale(64),
+        util::scale(28),
+    );
+    move_window(
+        c.ignore_label,
+        right,
+        util::scale(224),
+        column,
+        util::scale(18),
+    );
+    move_window(
+        c.ignore_apps,
+        right,
+        util::scale(244),
+        column,
+        util::scale(56),
     );
     move_window(
         c.ignore_hint,
         right,
-        util::scale(254),
+        util::scale(306),
         column,
-        (height - util::scale(254 + 8)).max(util::scale(18)),
+        (height - util::scale(306 + 8)).max(util::scale(18)),
     );
 }
 
@@ -1825,7 +1859,7 @@ unsafe extern "system" fn settings_proc(
                 ID_SYNC_ENABLED | ID_SYNC_ON_CHANGE | ID_BACKUP | ID_RESTORE_CLIPBOARD
                 | ID_AUTOSTART => mark_dirty(state),
                 ID_URL | ID_USER | ID_INTERVAL | ID_TIMEOUT | ID_HOLD_MS | ID_LIST_HOTKEY
-                | ID_CONFIG_HOTKEY | ID_IGNORE_APPS
+                | ID_CONFIG_HOTKEY | ID_HISTORY_HOTKEY | ID_IGNORE_APPS
                     if notification == EN_CHANGE =>
                 {
                     mark_dirty(state)
@@ -2325,6 +2359,9 @@ fn save(state: &mut SettingsState) -> bool {
     };
     config.hotkeys.list = window_text(state.behavior.list_hotkey).trim().to_string();
     config.hotkeys.config = window_text(state.behavior.config_hotkey).trim().to_string();
+    config.hotkeys.history = window_text(state.behavior.history_hotkey)
+        .trim()
+        .to_string();
     config.ignore_apps = window_text(state.behavior.ignore_apps)
         .lines()
         .flat_map(|line| line.split(','))

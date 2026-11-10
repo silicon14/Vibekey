@@ -33,8 +33,11 @@ App 状态：配置路径、Config、Keymap、SecretStore、主窗口 HWND、托
   添加托盘图标、启动钩子线程、启动同步线程、SetTimer 轮询配置文件 mtime。
 - WM_APP_ACTION（自定义，wparam=动作码，lparam=片段索引）：
   - LIST：打开片段列表（立即，不等待 Alt 松开）。
-  - CONFIG：打开配置菜单（立即）。
+  - HISTORY：打开内存文本剪贴板历史。
+  - CONFIG：通过 WM_APP_SHOW_MENU 排队打开配置菜单。
   - SNIPPET：把 (片段索引, 触发时的前台 HWND) 交给注入线程，注入线程等 Alt 松开后执行。
+- WM_CLIPBOARDUPDATE：用 HistoryControl 的互斥/序列号协议读取外部 Unicode 文本；忽略内部粘贴和恢复。
+- WM_APP_SHOW_MENU：取出排队的菜单坐标，TrackPopupMenu 前后分别短借用 App，禁止跨模态菜单保留 &mut App。
 - WM_APP_INJECT_DONE：注入成功/失败；失败时托盘气泡提示（节流）。
 - WM_APP_TRAY（NOTIFYICONDATA.uCallbackMessage）：WM_RBUTTONUP/WM_CONTEXTMENU 弹配置菜单；
   WM_LBUTTONUP 打开片段列表；WM_LBUTTONDBLCLK 打开设置。
@@ -70,8 +73,9 @@ App 状态：配置路径、Config、Keymap、SecretStore、主窗口 HWND、托
 
 ### inject.rs（输入工作线程）
 
-独立线程 + mpsc<InjectJob>。主线程只投递任务。任务字段：片段文本（已展开）、send_enter、目标 HWND、input_method、
-restore_clipboard。
+独立线程 + mpsc<InjectJob>。主线程只投递任务。任务字段：template、expand_template、send_enter、目标 HWND、
+input_method、restore_clipboard。片段在工作线程展开；历史 expand_template=false，必须原样粘贴。所有剪贴板写入和恢复
+都经 HistoryControl::internal_write，避免历史监听器采集内部操作。
 
 流程：
 
@@ -111,37 +115,45 @@ restore_clipboard。
 
 TrackPopupMenu（右键托盘或 Alt+Backspace）菜单项：
 
-1. 片段列表…
-2. 新建片段…
-3. 设置与片段管理…
-4. 编辑 TOML 配置（notepad.exe 打开 config.toml）
-5. 重新加载配置
-6. 立即同步（未启用同步时禁用；同步中禁用）
-7. 开机启动（勾选状态来自 Config.start_with_windows，点击写注册表 + 保存配置）
-8. 打开日志文件
-9. 关于（版本号、快捷键说明、配置路径）
-10. 退出
+1. 片段列表… / 剪贴板历史… / 新建片段… / 设置与片段管理…
+2. 清空剪贴板历史（无历史时禁用）
+3. 编辑 TOML 配置（notepad.exe 打开 config.toml）
+4. 重新加载配置
+5. 立即同步（未启用同步时禁用；同步中禁用）
+6. 开机启动（勾选状态来自 Config.start_with_windows，点击写注册表 + 保存配置）
+7. 打开日志文件
+8. 关于（版本号、快捷键说明、配置路径）
+9. 退出
 
 实现要点：SetForegroundWindow(主窗口) → TrackPopupMenu(TPM_RETURNCMD|TPM_RIGHTBUTTON) →
 PostMessageW(主窗口, WM_NULL, 0, 0)。坐标用 GetCursorPos（托盘）或光标插入符位置（Alt+Backspace 用
 GetGUIThreadInfo 的 rcCaret → ClientToScreen，失败回退 GetCursorPos）。
 
-### ui/popup.rs（片段列表）
+### ui/popup.rs（片段与剪贴板历史选择器）
 
 - 自绘窗口类 "VibekeyPopup"：WS_POPUP，WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED；共享 ui::theme 的浅色配色和中文字体。
 - SetLayeredWindowAttributes(LWA_ALPHA) 使用 242/255（约 95%）统一不透明度，不引入 GPU/UI 框架；失败时移除
   WS_EX_LAYERED 并回退为不透明。该 API 与 32 位 extended style 读写均兼容 Win7 x86/x64。
-- 顶部为标题和搜索 EDIT（EM_SETCUEBANNER），按名称、快捷键或内容预览过滤；中间是 LBS_OWNERDRAWFIXED ListBox，
-  每行显示 Alt 槽位徽标、名称和首行预览；底部显示结果数、“新建片段”和“编辑所选(F2)”。
-- 尺寸约 480 逻辑像素宽、最大约 390 高，行高 44、最多 6 行；标题、搜索框和底栏同步压缩。所有控件按 DPI 和
-  WM_SIZE 重排；宽高先按当前显示器工作区限制，再优先插入符定位，超出部分由列表滚动承载。
+- 搜索 EDIT 与右侧 ☰ 菜单按钮同一行；历史模式另显示“清空”。无标题、结果数或底栏。LBS_OWNERDRAWFIXED ListBox
+  每项只画一行：片段为 Alt 槽位徽标 + 名称 + 内容预览；历史为折叠后的 Unicode 文本。搜索使用未截断原文。
+- 宽度约 460 逻辑像素、最大约 270 高，行高 34、最多 6 行。所有控件按 DPI 和 WM_SIZE 重排；宽高先按工作区限制。
+  最终 SetWindowPos/SetFocus 后必须 LB_SETTOPINDEX=0，防止默认滚动把第一项裁掉。
 - 鼠标命中同时校验 LB_ITEMFROMPOINT 与 LB_GETITEMRECT，过滤后点击末行以下的空白不得执行最近一项。
-- 显示后 force_foreground + SetFocus，保留原来的目标窗口记录与失焦关闭行为。
-- 交互：Enter / 单击 / 双击条目 → 隐藏弹窗并注入；Esc → 关闭；F2 / 右键 / 编辑按钮 →
-  App::open_snippet_editor(Some(index))；新建按钮 → App::open_snippet_editor(None)。现有项同时携带 App 快照内容，
-  设置窗按完整 Snippet 身份匹配，未保存插入/删除或外部重载导致索引移位时不得按旧位置猜测。
-  单击仍由 ListBox 子类化的 WM_LBUTTONUP 判定，避免与方向键选择冲突。
+- 显示后 force_foreground + SetFocus，保留目标窗口记录与失焦关闭行为。☰ 仅计算坐标并调用 App::queue_menu，
+  不得在持有 App 借用时直接 TrackPopupMenu。
+- 交互：Enter / 单击 / 双击条目 → 隐藏弹窗并注入；Esc → 关闭。片段 F2 / 右键 →
+  App::open_snippet_editor(Some(index))；新建和设置从 ☰ 菜单进入。设置窗仍按完整 Snippet 身份匹配，不能按旧位置猜测。
+- 历史条目使用稳定 u64 ID，粘贴/Delete 前重新解析；Delete 仅删除选中的历史项，清空按钮删除全部。历史注入禁止模板展开。
 - 弹窗打开期间钩子透传，不触发片段。
+
+### history.rs（内存文本历史）
+
+- ClipboardHistory 最新项在前，最多 50 条，空文本不记录，完全相同的文本去重置顶；u64 ID 单调分配且清空不复用。
+- 不写磁盘、不记录明文日志、不参与同步，shutdown 清空。图片/文件/富文本 payload 不复制；仅记录 CF_UNICODETEXT。
+- AddClipboardFormatListener/RemoveClipboardFormatListener 与 GetClipboardSequenceNumber 都是 Win7 可用 API。
+- HistoryControl 的互斥门协调主线程捕获与 inject 写入。主线程 try_lock 后不睡眠读取，执行 sequence 前后复核；
+  worker 写入持同一锁，并在 CloseClipboard 前返回本次写入的 sequence。只登记该独占所有权下取得的序列，
+  不把操作结束后的外部最新序列误标为内部，避免自采集、TOCTOU 和外部历史漏采。
 
 ### ui/settings.rs（设置与片段管理）
 
@@ -151,8 +163,8 @@ GetGUIThreadInfo 的 rcCaret → ClientToScreen，失败回退 GetCursorPos）�
 
 - 片段库：搜索、owner-drawn 列表、新建/复制/删除；右侧直接编辑名称、12 个 Alt 槽位（或不绑定）、多行正文、
   send_enter、enabled；模板变量 combo + 插入按钮用 EM_REPLACESEL 插入到当前光标。
-- 输入与快捷键：paste/type、restore_clipboard、immediate/hold、hold_ms、start_with_windows、list/config 全局热键、
-  ignore_apps。所有 Config 行为字段都有图形化入口。
+- 输入与快捷键：paste/type、restore_clipboard、immediate/hold、hold_ms、start_with_windows、list/config/history
+  三个全局热键、ignore_apps。所有 Config 行为字段都有图形化入口。
 - 同步与备份：enabled、URL、用户名、密码、interval_minutes、timeout_secs、sync_on_change、backup_on_conflict、
   测试连接和“清除已保存密码”。密码继续只走 SecretStore，清除操作在应用时执行。
 

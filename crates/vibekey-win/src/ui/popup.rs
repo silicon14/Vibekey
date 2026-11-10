@@ -1,14 +1,9 @@
-//! Modern native snippet picker.
+//! Compact native picker for snippets and text clipboard history.
 //!
-//! The popup is a borderless, light themed Win32 window.  A cue-banner edit
-//! filters the snippets, an owner-drawn list presents shortcut/name/preview
-//! rows, and the footer exposes snippet creation and editing commands.  All
-//! controls and window procedures run on the application's main thread.
-//!
-//! Clicking a row inserts it immediately.  Arrow-key selection only changes the
-//! current row because mouse activation is handled by the list subclass on
-//! `WM_LBUTTONUP`, rather than by `LBN_SELCHANGE`.  Enter and double click also
-//! insert, Escape closes, and F2/right click edit the selected snippet.
+//! Both modes share one search box and an owner-drawn, single-line list. The
+//! search-row menu replaces the old title/footer/buttons. Enter or one click
+//! inserts the selected value; snippets additionally support F2/right-click
+//! editing, while history supports Delete and a Clear button.
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
@@ -23,7 +18,7 @@ use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, EM_SETCUEBANNER, MEASUREITEMSTRUCT, ODS_SELECTED,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, SetFocus, VK_DOWN, VK_ESCAPE, VK_F2, VK_RETURN, VK_UP,
+    EnableWindow, GetFocus, SetFocus, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_RETURN, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -34,91 +29,119 @@ const CLASS_NAME: &str = "VibekeyPopup";
 
 const SEARCH_ID: i32 = 100;
 const LISTBOX_ID: i32 = 101;
-const TITLE_ID: i32 = 102;
 const EMPTY_ID: i32 = 103;
-const COUNT_ID: i32 = 104;
-const NEW_BUTTON_ID: i32 = 110;
-const EDIT_BUTTON_ID: i32 = 111;
+const MENU_BUTTON_ID: i32 = 110;
+const CLEAR_BUTTON_ID: i32 = 112;
 
-const WIDTH_LOGICAL: i32 = 480;
-const MAX_HEIGHT_LOGICAL: i32 = 390;
-const ITEM_HEIGHT_LOGICAL: i32 = 44;
+const WIDTH_LOGICAL: i32 = 460;
+const MAX_HEIGHT_LOGICAL: i32 = 270;
+const ITEM_HEIGHT_LOGICAL: i32 = 34;
 const MAX_VISIBLE_ROWS: usize = 6;
-const LIST_TOP_LOGICAL: i32 = 82;
-const LIST_CHROME_LOGICAL: i32 = 126;
-const PREVIEW_CHARS: usize = 40;
+const LIST_TOP_LOGICAL: i32 = 48;
+const LIST_CHROME_LOGICAL: i32 = 56;
+const PREVIEW_CHARS: usize = 120;
 const POPUP_ALPHA: u8 = 242;
 
-// Static-control styles from WinUser.h.  Defining these two values locally
-// avoids enabling another windows-sys feature solely for style constants.
+// Static-control styles from WinUser.h. Defining these locally avoids enabling
+// another windows-sys feature solely for style constants.
 const STATIC_CENTER: u32 = 0x0001;
 const STATIC_CENTER_IMAGE: u32 = 0x0200;
 
-/// One snippet shown by the picker.
-///
-/// `snippet_index` always refers to the original `Config::snippet` vector, not
-/// to a filtered list row.  The display strings are detached from the config so
-/// filtering and owner drawing never borrow application configuration data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerMode {
+    Snippets,
+    History,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Snippet(usize),
+    History(u64),
+}
+
+/// Detached display/search data. IDs, rather than row positions, identify the
+/// value to execute so a clipboard update cannot turn a click into another item.
 #[derive(Debug, Clone)]
 pub struct PopupItem {
-    pub snippet_index: usize,
-    pub key: String,
-    pub name: String,
-    pub preview: String,
+    kind: ItemKind,
+    key: String,
+    name: String,
+    preview: String,
+    search_text: String,
 }
 
 impl PopupItem {
     pub fn from_snippet(index: usize, snippet: &vibekey_core::Snippet) -> Self {
         let name = snippet.name.trim();
-        let first_line = snippet.text.lines().next().unwrap_or("");
-        let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
-        let preview = if collapsed.chars().count() > PREVIEW_CHARS {
-            let mut preview = collapsed
-                .chars()
-                .take(PREVIEW_CHARS - 1)
-                .collect::<String>();
-            preview.push('…');
-            preview
+        let name = if name.is_empty() {
+            "（无名称）".to_string()
         } else {
-            collapsed
+            name.to_string()
         };
-
+        let key = snippet.key.trim().to_string();
+        let preview = single_line(&snippet.text);
+        let search_text = format!(
+            "{} {} {} alt+{}",
+            name.to_lowercase(),
+            key.to_lowercase(),
+            snippet.text.to_lowercase(),
+            key.to_lowercase()
+        );
         Self {
-            snippet_index: index,
-            key: snippet.key.trim().to_string(),
-            name: if name.is_empty() {
-                "（无名称）".to_string()
-            } else {
-                name.to_string()
-            },
+            kind: ItemKind::Snippet(index),
+            key,
+            name,
             preview,
+            search_text,
         }
+    }
+
+    pub fn from_history(id: u64, text: &str) -> Self {
+        Self {
+            kind: ItemKind::History(id),
+            key: String::new(),
+            name: String::new(),
+            preview: single_line(text),
+            search_text: text.to_lowercase(),
+        }
+    }
+}
+
+/// Collapse all whitespace/newlines for one-row presentation. The original text
+/// remains untouched in Config/ClipboardHistory and is what gets inserted.
+fn single_line(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > PREVIEW_CHARS {
+        let mut preview = collapsed
+            .chars()
+            .take(PREVIEW_CHARS - 1)
+            .collect::<String>();
+        preview.push('…');
+        preview
+    } else {
+        collapsed
     }
 }
 
 #[derive(Default, Clone, Copy)]
 struct Controls {
-    title: HWND,
     search: HWND,
     listbox: HWND,
     empty: HWND,
-    count: HWND,
-    new_button: HWND,
-    edit_button: HWND,
+    menu_button: HWND,
+    clear_button: HWND,
 }
 
-/// The snippet picker. Only one instance exists and it is owned by the app.
+/// Only one picker exists and it is owned by App on the main thread.
 pub struct Popup {
     hwnd: HWND,
     controls: Controls,
-    /// Every item supplied to `show`, in its original order.
+    mode: PickerMode,
     items: Vec<PopupItem>,
-    /// Indices into `items` for the currently visible list rows.
+    /// Indices into `items` for the currently visible rows.
     visible: Vec<usize>,
-    /// Window that was selected as the injection target when the popup opened.
     target: HWND,
     open: bool,
-    /// Prevents the programmatic search reset in `show` from filtering twice.
     suppress_search_change: bool,
 }
 
@@ -127,6 +150,7 @@ impl Popup {
         Self {
             hwnd: std::ptr::null_mut(),
             controls: Controls::default(),
+            mode: PickerMode::Snippets,
             items: Vec::new(),
             visible: Vec::new(),
             target: std::ptr::null_mut(),
@@ -143,29 +167,66 @@ impl Popup {
         self.target
     }
 
-    /// Map a filtered list row back to its original `Config::snippet` index.
-    pub fn item(&self, index: usize) -> Option<usize> {
-        self.visible_item(index).map(|item| item.snippet_index)
-    }
-
     fn visible_item(&self, index: usize) -> Option<&PopupItem> {
         let item_index = *self.visible.get(index)?;
         self.items.get(item_index)
     }
 
-    /// Show the picker. Returns false only when its Win32 window cannot be made.
-    pub fn show(&mut self, owner: HWND, items: Vec<PopupItem>, target: HWND) -> bool {
+    fn snippet_index(&self, index: usize) -> Option<usize> {
+        match self.visible_item(index)?.kind {
+            ItemKind::Snippet(snippet_index) => Some(snippet_index),
+            ItemKind::History(_) => None,
+        }
+    }
+
+    /// Show either picker mode. An empty history is a valid state with its own
+    /// empty label; an empty snippet list is handled by App before this call.
+    pub fn show(
+        &mut self,
+        owner: HWND,
+        mode: PickerMode,
+        items: Vec<PopupItem>,
+        target: HWND,
+    ) -> bool {
         if let Err(error) = self.ensure_window(owner) {
-            log::error!("could not create the snippet popup: {error}");
+            log::error!("could not create the picker popup: {error}");
             return false;
         }
 
+        self.mode = mode;
         self.items = items;
         self.target = target;
         self.open = true;
+        set_control_text(
+            self.hwnd,
+            match mode {
+                PickerMode::Snippets => "Vibekey 片段选择器",
+                PickerMode::History => "Vibekey 剪贴板历史",
+            },
+        );
+        let cue = wide(match mode {
+            PickerMode::Snippets => "搜索片段…",
+            PickerMode::History => "搜索剪贴板历史…",
+        });
+        // SAFETY: the search is a live child and the cue buffer is copied by the
+        // control synchronously. Clear exists only in history mode.
+        unsafe {
+            SendMessageW(
+                self.controls.search,
+                EM_SETCUEBANNER,
+                1,
+                cue.as_ptr() as isize,
+            );
+            ShowWindow(
+                self.controls.clear_button,
+                if mode == PickerMode::History {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
+        }
 
-        // A new picker session always starts with the complete list.  Suppress
-        // EN_CHANGE because SetWindowTextW dispatches it synchronously.
         self.suppress_search_change = true;
         set_control_text(self.controls.search, "");
         self.suppress_search_change = false;
@@ -173,23 +234,18 @@ impl Popup {
 
         let anchor = util::caret_pos();
         let work = util::monitor_work_area(anchor);
-        let work_width = work.right - work.left;
-        let work_height = work.bottom - work.top;
-        let width =
-            util::scale(WIDTH_LOGICAL).min((work_width - util::scale(8)).max(util::scale(1)));
+        let width = util::scale(WIDTH_LOGICAL)
+            .min((work.right - work.left - util::scale(8)).max(util::scale(1)));
         let rows = self.visible.len().clamp(1, MAX_VISIBLE_ROWS) as i32;
         let wanted_height =
             util::scale(LIST_CHROME_LOGICAL) + rows * util::scale(ITEM_HEIGHT_LOGICAL);
-        // Limit both dimensions before positioning. On high-DPI displays the
-        // logical design can otherwise be taller than the physical work area,
-        // putting the edit/new buttons off screen.
         let height = wanted_height
             .min(util::scale(MAX_HEIGHT_LOGICAL))
-            .min((work_height - util::scale(8)).max(util::scale(1)));
+            .min((work.bottom - work.top - util::scale(8)).max(util::scale(1)));
         let position = util::clamp_to_monitor(anchor, width, height);
 
-        // SAFETY: the popup handle is live and the coordinates/size describe a
-        // physical-pixel rectangle clamped to the nearest monitor's work area.
+        // SAFETY: the popup handle is live and the physical-pixel rectangle has
+        // been clamped to the nearest monitor's work area.
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -203,14 +259,9 @@ impl Popup {
             ShowWindow(self.hwnd, SW_SHOW);
         }
 
-        // SetForegroundWindow alone is often refused after a global hotkey.
-        // force_foreground temporarily attaches the input queues, preserving the
-        // established keyboard-focus behaviour of the original picker.
-        let activated = util::force_foreground(self.hwnd);
-        if !activated {
-            log::warn!("could not take the foreground for the snippet list");
-            // Keep the picker visible above its target even if activation fails.
-            // SAFETY: the popup handle is live; only its Z order is changed.
+        if !util::force_foreground(self.hwnd) {
+            log::warn!("could not take the foreground for the picker");
+            // SAFETY: only the live popup's Z order is changed.
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -223,12 +274,13 @@ impl Popup {
                 );
             }
         }
-
-        // Search is the natural initial focus for a filterable picker.  The list
-        // already has row zero selected, so Enter works without focusing it.
-        // SAFETY: the search control is a live child of the active popup.
+        // Resizing a previously empty/tiny ListBox can scroll its selection to
+        // row one. Restore the intended initial view only after the final size
+        // and focus have been applied, otherwise the first row stays clipped.
+        // SAFETY: both controls are live children of the active popup.
         unsafe {
             SetFocus(self.controls.search);
+            SendMessageW(self.controls.listbox, LB_SETTOPINDEX, 0, 0);
         }
         true
     }
@@ -236,14 +288,26 @@ impl Popup {
     pub fn hide(&mut self) {
         self.open = false;
         if !self.hwnd.is_null() {
-            // SAFETY: the popup handle is live and is only hidden, not destroyed.
+            // SAFETY: the live popup is only hidden, not destroyed.
             unsafe {
                 ShowWindow(self.hwnd, SW_HIDE);
             }
         }
     }
 
-    /// Rebuild the filtered row mapping and all list-dependent controls.
+    /// Remove one history value after Delete, retaining the user's query.
+    fn remove_history(&mut self, id: u64) {
+        self.items.retain(|item| item.kind != ItemKind::History(id));
+        let query = control_text(self.controls.search);
+        self.apply_filter(&query);
+    }
+
+    fn clear_history(&mut self) {
+        self.items.clear();
+        let query = control_text(self.controls.search);
+        self.apply_filter(&query);
+    }
+
     fn apply_filter(&mut self, query: &str) {
         let query = query.trim().to_lowercase();
         self.visible = self
@@ -255,9 +319,8 @@ impl Popup {
             .collect();
 
         let empty = wide("");
-        // SAFETY: the list is a live owner-drawn list box.  It copies every
-        // string because LBS_HASSTRINGS is set; row text itself comes from
-        // `visible_item` during WM_DRAWITEM, not from these empty labels.
+        // SAFETY: the list is a live owner-drawn list box. LBS_HASSTRINGS copies
+        // these empty labels; actual row text comes from visible_item.
         unsafe {
             SendMessageW(self.controls.listbox, WM_SETREDRAW, 0, 0);
             SendMessageW(self.controls.listbox, LB_RESETCONTENT, 0, 0);
@@ -277,6 +340,10 @@ impl Popup {
             }
             SendMessageW(self.controls.listbox, WM_SETREDRAW, 1, 0);
             InvalidateRect(self.controls.listbox, std::ptr::null(), 1);
+            EnableWindow(
+                self.controls.clear_button,
+                (self.mode == PickerMode::History && !self.items.is_empty()) as i32,
+            );
         }
 
         let has_rows = !self.visible.is_empty();
@@ -290,25 +357,14 @@ impl Popup {
                 self.controls.empty,
                 if has_rows { SW_HIDE } else { SW_SHOW },
             );
-            EnableWindow(self.controls.edit_button, has_rows as i32);
         }
-
-        let empty_text = if self.items.is_empty() {
-            "还没有片段\r\n点击“新建片段”创建第一个片段"
-        } else {
-            "没有匹配的片段\r\n试试其他关键词，或按 Esc 关闭"
+        let empty_text = match (self.mode, self.items.is_empty()) {
+            (PickerMode::Snippets, true) => "暂无可用片段",
+            (PickerMode::Snippets, false) => "没有匹配的片段",
+            (PickerMode::History, true) => "暂无剪贴板历史",
+            (PickerMode::History, false) => "没有匹配的历史",
         };
         set_control_text(self.controls.empty, empty_text);
-        let count_text = if self.visible.len() == self.items.len() {
-            format!("共 {} 个片段", self.items.len())
-        } else {
-            format!(
-                "{} 个结果（共 {} 个）",
-                self.visible.len(),
-                self.items.len()
-            )
-        };
-        set_control_text(self.controls.count, &count_text);
     }
 
     fn ensure_window(&mut self, owner: HWND) -> Result<(), String> {
@@ -324,7 +380,7 @@ impl Popup {
         let class = wide(CLASS_NAME);
         let title = wide("Vibekey 片段选择器");
         // SAFETY: the registered class and NUL-terminated strings remain valid
-        // for the call.  WS_POPUP deliberately has no system WS_BORDER.
+        // for the call. WS_POPUP deliberately has no system border.
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
@@ -346,20 +402,9 @@ impl Popup {
         }
         self.hwnd = hwnd;
         if !util::set_window_alpha(hwnd, POPUP_ALPHA) {
-            // The helper already removed WS_EX_LAYERED. Keep using the normal
-            // opaque window rather than losing the picker on older systems.
             log::warn!("popup transparency is unavailable; using opaque drawing");
         }
 
-        self.controls.title = create_control(
-            hwnd,
-            instance,
-            "STATIC",
-            "搜索并选择片段",
-            WS_CHILD | WS_VISIBLE | STATIC_CENTER_IMAGE,
-            0,
-            TITLE_ID,
-        );
         self.controls.search = create_control(
             hwnd,
             instance,
@@ -394,49 +439,37 @@ impl Popup {
             0,
             EMPTY_ID,
         );
-        self.controls.count = create_control(
-            hwnd,
-            instance,
-            "STATIC",
-            "",
-            WS_CHILD | WS_VISIBLE | STATIC_CENTER_IMAGE,
-            0,
-            COUNT_ID,
-        );
-        self.controls.new_button = create_control(
+        self.controls.menu_button = create_control(
             hwnd,
             instance,
             "BUTTON",
-            "新建片段",
+            "☰",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32,
             0,
-            NEW_BUTTON_ID,
+            MENU_BUTTON_ID,
         );
-        self.controls.edit_button = create_control(
+        self.controls.clear_button = create_control(
             hwnd,
             instance,
             "BUTTON",
-            "编辑所选(F2)",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32,
+            "清空",
+            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32,
             0,
-            EDIT_BUTTON_ID,
+            CLEAR_BUTTON_ID,
         );
 
         let controls = self.controls;
         if [
-            controls.title,
             controls.search,
             controls.listbox,
             controls.empty,
-            controls.count,
-            controls.new_button,
-            controls.edit_button,
+            controls.menu_button,
+            controls.clear_button,
         ]
         .iter()
         .any(|handle| handle.is_null())
         {
-            // SAFETY: creation of at least one child failed, so the hidden popup
-            // and any children already created are destroyed together.
+            // SAFETY: creation failed; the hidden parent destroys any children.
             unsafe {
                 DestroyWindow(hwnd);
             }
@@ -445,18 +478,14 @@ impl Popup {
             return Err("could not create one or more popup controls".to_string());
         }
 
-        theme::set_font(controls.title, theme::semibold_font());
         theme::set_font(controls.search, theme::body_font());
         theme::set_font(controls.empty, theme::body_font());
-        theme::set_font(controls.count, theme::small_font());
-        theme::set_font(controls.new_button, theme::semibold_font());
-        theme::set_font(controls.edit_button, theme::body_font());
+        theme::set_font(controls.menu_button, theme::semibold_font());
+        theme::set_font(controls.clear_button, theme::small_font());
 
-        let cue = wide("搜索名称、快捷键或内容预览…");
         // SAFETY: all child handles are live, shared theme fonts outlive them,
-        // and the cue string is copied synchronously by the edit control.
+        // and subclass predecessors are retained for every subsequent message.
         unsafe {
-            SendMessageW(controls.search, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
             SendMessageW(
                 controls.listbox,
                 LB_SETITEMHEIGHT,
@@ -484,21 +513,11 @@ impl Default for Popup {
     }
 }
 
-/// Case-insensitive substring filtering over name, shortcut and content preview.
-/// Multiple whitespace-separated terms must all match.  `Alt+1` also matches a
-/// snippet whose stored key is just `1`.
+/// Case-insensitive AND filtering over full text, not just the visible preview.
 fn matches_query(item: &PopupItem, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let haystack = format!(
-        "{} {} {} alt+{}",
-        item.name.to_lowercase(),
-        item.key.to_lowercase(),
-        item.preview.to_lowercase(),
-        item.key.to_lowercase()
-    );
-    query.split_whitespace().all(|term| haystack.contains(term))
+    query
+        .split_whitespace()
+        .all(|term| item.search_text.contains(term))
 }
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -528,7 +547,6 @@ fn ensure_class() -> bool {
     true
 }
 
-/// Create one standard Win32 child control without a system border.
 fn create_control(
     parent: HWND,
     instance: windows_sys::Win32::Foundation::HMODULE,
@@ -541,7 +559,7 @@ fn create_control(
     let class_name = wide(class_name);
     let text = wide(text);
     // SAFETY: the parent/module are valid, both strings are NUL terminated and
-    // live for the call, and `id` is encoded as the documented child HMENU.
+    // live for the call, and id is encoded as the documented child HMENU.
     unsafe {
         CreateWindowExW(
             ex_style,
@@ -581,22 +599,20 @@ fn control_text(hwnd: HWND) -> String {
         return String::new();
     }
     let mut buffer = vec![0u16; length as usize + 1];
-    // SAFETY: the buffer has `length + 1` writable UTF-16 code units and its
+    // SAFETY: the buffer has length + 1 writable UTF-16 code units and its
     // actual capacity is passed to GetWindowTextW.
     let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
     String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
 }
 
-/// Hide the popup if the application instance still exists.
 fn hide_popup() {
-    // SAFETY: window procedures run only on the main thread.  During shutdown
-    // the app pointer may already be cleared, in which case there is no popup.
+    // SAFETY: window procedures run only on the main thread and tolerate the App
+    // pointer having already been cleared during shutdown.
     if let Some(app) = unsafe { crate::app::try_app_mut() } {
         app.popup.hide();
     }
 }
 
-/// Handler of the top-level popup and owner-draw notifications.
 unsafe extern "system" fn popup_proc(
     hwnd: HWND,
     message: u32,
@@ -605,7 +621,6 @@ unsafe extern "system" fn popup_proc(
 ) -> LRESULT {
     match message {
         WM_ACTIVATE => {
-            // Child focus changes do not deactivate the top-level popup.
             if (wparam as u32 & 0xFFFF) == WA_INACTIVE {
                 hide_popup();
             }
@@ -618,12 +633,11 @@ unsafe extern "system" fn popup_proc(
             0
         }
         WM_MEASUREITEM => {
-            // SAFETY: Win32 supplies a valid MEASUREITEMSTRUCT for this message;
-            // the null check also tolerates malformed synthetic messages.
+            // SAFETY: Win32 supplies a valid structure for this message; the
+            // null check also tolerates malformed synthetic messages.
             let measure = lparam as *mut MEASUREITEMSTRUCT;
             if !measure.is_null() && unsafe { (*measure).CtlID } == LISTBOX_ID as u32 {
-                // SAFETY: the pointer was validated above and points to the
-                // writable structure supplied by Win32.
+                // SAFETY: the pointer was checked and is writable for this message.
                 unsafe {
                     (*measure).itemHeight = util::scale(ITEM_HEIGHT_LOGICAL) as u32;
                 }
@@ -666,8 +680,7 @@ unsafe extern "system" fn popup_proc(
         WM_CTLCOLORBTN => theme::surface_brush() as isize,
         WM_ERASEBKGND => {
             let mut client = util::rect(0, 0, 0, 0);
-            // SAFETY: client is a valid out rectangle and wparam is the DC
-            // supplied with WM_ERASEBKGND.
+            // SAFETY: client is writable and wparam is the supplied DC.
             unsafe {
                 GetClientRect(hwnd, &mut client);
             }
@@ -679,8 +692,6 @@ unsafe extern "system" fn popup_proc(
             0
         }
         WM_LBUTTONUP => {
-            // Preserve the original click-on-empty-chrome behaviour.  Clicks on
-            // child controls are dispatched to those children instead.
             hide_popup();
             0
         }
@@ -689,8 +700,7 @@ unsafe extern "system" fn popup_proc(
             0
         }
         _ => {
-            // SAFETY: unhandled messages use the default procedure with the
-            // original arguments supplied by Win32.
+            // SAFETY: unhandled messages use the default procedure unchanged.
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
     }
@@ -701,8 +711,7 @@ fn handle_command(hwnd: HWND, wparam: WPARAM) {
     let notification = (wparam as u32 >> 16) & 0xFFFF;
     match (id, notification) {
         (SEARCH_ID, EN_CHANGE) => {
-            // SAFETY: this is a main-thread control notification; the app may be
-            // absent only while the process is shutting down.
+            // SAFETY: this main-thread notification tolerates shutdown's missing App.
             if let Some(app) = unsafe { crate::app::try_app_mut() } {
                 if !app.popup.suppress_search_change {
                     let query = control_text(app.popup.controls.search);
@@ -711,47 +720,97 @@ fn handle_command(hwnd: HWND, wparam: WPARAM) {
             }
         }
         (SEARCH_ID, EN_SETFOCUS) | (SEARCH_ID, EN_KILLFOCUS) => {
-            // SAFETY: a null rectangle invalidates the whole popup so the search
-            // frame can repaint its focus colour.  No background erase is needed.
+            // SAFETY: invalidate the popup so the search frame repaints.
             unsafe {
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
         }
-        (NEW_BUTTON_ID, BN_CLICKED) => open_new_snippet(),
-        (EDIT_BUTTON_ID, BN_CLICKED) => edit_selected(),
+        (MENU_BUTTON_ID, BN_CLICKED) => open_quick_menu(),
+        (CLEAR_BUTTON_ID, BN_CLICKED) => clear_history(),
         _ => {}
     }
 }
 
-/// DPI-aware layout shared by initial WM_SIZE and subsequent window resizing.
+struct SearchChrome {
+    frame: RECT,
+    menu: RECT,
+    clear: RECT,
+}
+
+fn search_chrome(width: i32, history: bool) -> SearchChrome {
+    let margin = util::scale(12);
+    let gap = util::scale(8);
+    let menu = util::rect(
+        (width - margin - util::scale(30)).max(margin),
+        util::scale(10),
+        (width - margin).max(margin),
+        util::scale(40),
+    );
+    let clear = if history {
+        util::rect(
+            (menu.left - gap - util::scale(44)).max(margin),
+            menu.top,
+            (menu.left - gap).max(margin),
+            menu.bottom,
+        )
+    } else {
+        util::rect(0, 0, 0, 0)
+    };
+    let right = if history { clear.left } else { menu.left } - gap;
+    SearchChrome {
+        frame: util::rect(margin, util::scale(9), right.max(margin), util::scale(41)),
+        menu,
+        clear,
+    }
+}
+
+fn popup_is_history(hwnd: HWND) -> bool {
+    // SAFETY: layout/paint run on the main thread; a missing App during shutdown
+    // simply uses the snippet geometry for the final paint.
+    unsafe { crate::app::try_app_mut() }
+        .map(|app| app.popup.hwnd == hwnd && app.popup.mode == PickerMode::History)
+        .unwrap_or(false)
+}
+
 fn layout_controls(hwnd: HWND, width: i32, height: i32) {
     if width <= 0 || height <= 0 {
         return;
     }
-    let margin = util::scale(14);
-    let search_top = util::scale(44);
-    let search_height = util::scale(30);
-    let list_top = util::scale(LIST_TOP_LOGICAL);
-    let footer_height = util::scale(44);
-    let list_height = (height - list_top - footer_height).max(util::scale(ITEM_HEIGHT_LOGICAL));
-    let content_width = (width - 2 * margin).max(0);
-
-    move_control(
-        hwnd,
-        TITLE_ID,
-        margin,
-        util::scale(8),
-        content_width,
-        util::scale(26),
-    );
+    let history = popup_is_history(hwnd);
+    let chrome = search_chrome(width, history);
+    let border = util::scale(1).max(1);
+    let inset = util::scale(7);
     move_control(
         hwnd,
         SEARCH_ID,
-        margin + util::scale(10),
-        search_top + util::scale(5),
-        (content_width - 2 * util::scale(10)).max(0),
-        search_height - 2 * util::scale(5),
+        chrome.frame.left + inset,
+        chrome.frame.top + util::scale(5),
+        (chrome.frame.right - chrome.frame.left - 2 * inset).max(0),
+        (chrome.frame.bottom - chrome.frame.top - util::scale(10)).max(0),
     );
+    move_control(
+        hwnd,
+        MENU_BUTTON_ID,
+        chrome.menu.left,
+        chrome.menu.top,
+        chrome.menu.right - chrome.menu.left,
+        chrome.menu.bottom - chrome.menu.top,
+    );
+    if history {
+        move_control(
+            hwnd,
+            CLEAR_BUTTON_ID,
+            chrome.clear.left,
+            chrome.clear.top,
+            chrome.clear.right - chrome.clear.left,
+            chrome.clear.bottom - chrome.clear.top,
+        );
+    }
+
+    let margin = util::scale(12);
+    let list_top = util::scale(LIST_TOP_LOGICAL);
+    let list_height = (height - list_top - util::scale(8) - border).max(0);
+    let content_width = (width - 2 * margin).max(0);
     move_control(
         hwnd,
         LISTBOX_ID,
@@ -761,38 +820,6 @@ fn layout_controls(hwnd: HWND, width: i32, height: i32) {
         list_height,
     );
     move_control(hwnd, EMPTY_ID, margin, list_top, content_width, list_height);
-
-    let button_height = util::scale(26);
-    let button_y = height - util::scale(34);
-    let new_width = util::scale(88);
-    let edit_width = util::scale(108);
-    let button_gap = util::scale(8);
-    let edit_x = width - margin - edit_width;
-    let new_x = edit_x - button_gap - new_width;
-    move_control(
-        hwnd,
-        NEW_BUTTON_ID,
-        new_x,
-        button_y,
-        new_width,
-        button_height,
-    );
-    move_control(
-        hwnd,
-        EDIT_BUTTON_ID,
-        edit_x,
-        button_y,
-        edit_width,
-        button_height,
-    );
-    move_control(
-        hwnd,
-        COUNT_ID,
-        margin,
-        height - util::scale(32),
-        (new_x - margin - util::scale(12)).max(0),
-        util::scale(22),
-    );
 }
 
 fn move_control(parent: HWND, id: i32, x: i32, y: i32, width: i32, height: i32) {
@@ -801,16 +828,14 @@ fn move_control(parent: HWND, id: i32, x: i32, y: i32, width: i32, height: i32) 
     if control.is_null() {
         return;
     }
-    // SAFETY: the child handle was returned by GetDlgItem and all dimensions are
-    // physical client coordinates.  Repainting keeps filtered/empty states aligned.
+    // SAFETY: all dimensions are physical client coordinates.
     unsafe {
         MoveWindow(control, x, y, width, height, 1);
     }
 }
 
 fn paint_popup(hwnd: HWND) {
-    // SAFETY: paint is a valid out structure; BeginPaint/EndPaint are paired for
-    // this live popup and all drawing uses the returned DC.
+    // SAFETY: BeginPaint/EndPaint are paired and all drawing uses the returned DC.
     unsafe {
         let mut paint: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(hwnd, &mut paint);
@@ -822,18 +847,12 @@ fn paint_popup(hwnd: HWND) {
         GetClientRect(hwnd, &mut client);
         theme::fill(hdc, &client, theme::SURFACE);
 
-        let margin = util::scale(14);
-        let search_frame = util::rect(
-            margin,
-            util::scale(44),
-            client.right - margin,
-            util::scale(74),
-        );
+        let chrome = search_chrome(client.right, popup_is_history(hwnd));
         let search = GetDlgItem(hwnd, SEARCH_ID);
         let focused = !search.is_null() && GetFocus() == search;
         theme::fill_rounded(
             hdc,
-            &search_frame,
+            &chrome.frame,
             util::scale(8),
             if focused {
                 theme::ACCENT
@@ -843,16 +862,12 @@ fn paint_popup(hwnd: HWND) {
         );
         let border = util::scale(1).max(1);
         let inner = util::rect(
-            search_frame.left + border,
-            search_frame.top + border,
-            search_frame.right - border,
-            search_frame.bottom - border,
+            chrome.frame.left + border,
+            chrome.frame.top + border,
+            chrome.frame.right - border,
+            chrome.frame.bottom - border,
         );
         theme::fill_rounded(hdc, &inner, util::scale(7), theme::SURFACE);
-
-        let separator_y = client.bottom - util::scale(44);
-        let separator = util::rect(margin, separator_y, client.right - margin, separator_y + 1);
-        theme::fill(hdc, &separator, theme::BORDER);
 
         let brush = CreateSolidBrush(theme::BORDER);
         if !brush.is_null() {
@@ -868,8 +883,7 @@ fn draw_list_item(draw: &DRAWITEMSTRUCT) {
     if draw.itemID == u32::MAX {
         return;
     }
-    // Clone the small display model so no App reference remains borrowed while
-    // GDI calls are made.  The app can be absent during shutdown.
+    // Clone the display model so no App borrow remains live across GDI calls.
     // SAFETY: owner drawing is dispatched on the main thread.
     let item = unsafe { crate::app::try_app_mut() }
         .and_then(|app| app.popup.visible_item(draw.itemID as usize).cloned());
@@ -890,79 +904,67 @@ fn draw_list_item(draw: &DRAWITEMSTRUCT) {
         theme::fill_rounded(draw.hDC, &selection, util::scale(6), theme::ACCENT_SOFT);
     }
 
-    let chip = util::rect(
-        row.left + util::scale(8),
-        row.top + util::scale(11),
-        row.left + util::scale(68),
-        row.top + util::scale(33),
-    );
-    theme::fill_rounded(
-        draw.hDC,
-        &chip,
-        util::scale(6),
-        if selected {
-            theme::ACCENT
+    let mut text_left = row.left + util::scale(12);
+    if let ItemKind::Snippet(_) = item.kind {
+        let chip = util::rect(
+            row.left + util::scale(6),
+            row.top + util::scale(7),
+            row.left + util::scale(62),
+            row.top + util::scale(27),
+        );
+        theme::fill_rounded(
+            draw.hDC,
+            &chip,
+            util::scale(5),
+            if selected {
+                theme::ACCENT
+            } else {
+                theme::ACCENT_SOFT
+            },
+        );
+        let shortcut = if item.key.is_empty() {
+            "—".to_string()
         } else {
-            theme::ACCENT_SOFT
-        },
-    );
-    let shortcut = if item.key.is_empty() {
-        "无快捷键".to_string()
-    } else {
-        format!("Alt+{}", item.key)
-    };
-    draw_centred_text(
-        draw.hDC,
-        &chip,
-        &shortcut,
-        if selected {
-            theme::SURFACE
-        } else {
-            theme::ACCENT_DARK
-        },
-    );
+            format!("Alt+{}", item.key)
+        };
+        draw_centred_text(
+            draw.hDC,
+            &chip,
+            &shortcut,
+            if selected {
+                theme::SURFACE
+            } else {
+                theme::ACCENT_DARK
+            },
+        );
+        text_left = row.left + util::scale(72);
+    }
 
-    let text_left = row.left + util::scale(78);
-    let text_right = row.right - util::scale(10);
-    if text_right <= text_left {
+    let text_rect = util::rect(
+        text_left,
+        row.top + util::scale(2),
+        row.right - util::scale(10),
+        row.bottom - util::scale(2),
+    );
+    if text_rect.right <= text_rect.left {
         return;
     }
-    let name_rect = util::rect(
-        text_left,
-        row.top + util::scale(3),
-        text_right,
-        row.top + util::scale(21),
-    );
-    let preview_rect = util::rect(
-        text_left,
-        row.top + util::scale(23),
-        text_right,
-        row.top + util::scale(41),
-    );
-    theme::text(
-        draw.hDC,
-        &name_rect,
-        &item.name,
-        theme::semibold_font(),
-        theme::TEXT,
-        true,
-    );
-    let preview = if item.preview.is_empty() {
-        "（无内容预览）"
-    } else {
-        item.preview.as_str()
+    let value = match item.kind {
+        ItemKind::Snippet(_) if item.preview.is_empty() => item.name,
+        ItemKind::Snippet(_) => format!("{}  ·  {}", item.name, item.preview),
+        ItemKind::History(_) if item.preview.is_empty() => "（空白文本）".to_string(),
+        ItemKind::History(_) => item.preview,
     };
     theme::text(
         draw.hDC,
-        &preview_rect,
-        preview,
-        theme::small_font(),
-        theme::TEXT_MUTED,
+        &text_rect,
+        &value,
+        theme::body_font(),
+        theme::TEXT,
         true,
     );
 }
 
-/// Centred text used only for the shortcut chip; all other text uses theme::text.
 fn draw_centred_text(
     hdc: windows_sys::Win32::Graphics::Gdi::HDC,
     rect: &RECT,
@@ -971,8 +973,8 @@ fn draw_centred_text(
 ) {
     let mut draw_rect = *rect;
     let value = wide(value);
-    // SAFETY: the DC/rectangle belong to the active owner-draw operation, the
-    // UTF-16 buffer is NUL terminated, and the shared font is process-lived.
+    // SAFETY: the DC/rectangle belong to the active draw operation, the UTF-16
+    // buffer is NUL terminated, and the shared font is process-lived.
     unsafe {
         let old_font = SelectObject(hdc, theme::small_font());
         SetBkMode(hdc, TRANSPARENT as i32);
@@ -988,8 +990,6 @@ fn draw_centred_text(
     }
 }
 
-/// Search keyboard behaviour: Escape closes, Enter inserts the current list
-/// selection, Down moves to the list, and F2 edits that selection.
 unsafe extern "system" fn search_proc(
     hwnd: HWND,
     message: u32,
@@ -1020,7 +1020,6 @@ unsafe extern "system" fn search_proc(
     call_old_search_proc(hwnd, message, wparam, lparam)
 }
 
-/// List keyboard/mouse behaviour, including immediate single-click insertion.
 unsafe extern "system" fn listbox_proc(
     hwnd: HWND,
     message: u32,
@@ -1039,6 +1038,10 @@ unsafe extern "system" fn listbox_proc(
             }
             VK_F2 => {
                 edit_selected();
+                return 0;
+            }
+            VK_DELETE => {
+                delete_selected();
                 return 0;
             }
             _ => {}
@@ -1070,10 +1073,9 @@ unsafe fn call_old_list_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         // SAFETY: fallback for a missing subclass predecessor.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
-    // SAFETY: the atomic stores the original LISTBOX WNDPROC installed by
-    // Windows, and CallWindowProcW receives the unchanged message arguments.
+    // SAFETY: the atomic stores the original LISTBOX WNDPROC installed by Windows.
     let previous: WNDPROC = unsafe { std::mem::transmute(old) };
-    // SAFETY: `previous` is the validated system list procedure described above.
+    // SAFETY: previous is the validated system procedure described above.
     unsafe { CallWindowProcW(previous, hwnd, message, wparam, lparam) }
 }
 
@@ -1090,25 +1092,21 @@ unsafe fn call_old_search_proc(
     }
     // SAFETY: the atomic stores the original EDIT WNDPROC installed by Windows.
     let previous: WNDPROC = unsafe { std::mem::transmute(old) };
-    // SAFETY: `previous` is called with the unchanged edit-message arguments.
+    // SAFETY: previous is called with unchanged arguments.
     unsafe { CallWindowProcW(previous, hwnd, message, wparam, lparam) }
 }
 
-/// Resolve a list mouse position without relying on LBN_SELCHANGE.
+/// Resolve a click without accepting the nearest row below the final item.
 fn clicked_index(hwnd: HWND, lparam: LPARAM) -> Option<usize> {
     let x = (lparam & 0xFFFF) as u16 as i16 as i32;
     let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
     let packed = (((y as u16 as u32) << 16) | (x as u16 as u32)) as isize;
-    // SAFETY: LB_ITEMFROMPOINT reads the live list and the packed signed client
-    // coordinates use the documented LOWORD/HIWORD representation.
+    // SAFETY: LB_ITEMFROMPOINT reads the live list with signed client coordinates.
     let result = unsafe { SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, packed) };
     if ((result >> 16) & 0xFFFF) != 0 {
         return None;
     }
     let index = (result & 0xFFFF) as usize;
-    // LB_ITEMFROMPOINT returns the nearest item even below the last row when
-    // the point is inside the list client. Validate the actual item rectangle
-    // so clicking unused space after filtering cannot insert or edit that row.
     // SAFETY: LB_GETCOUNT only queries the live list control.
     let count = unsafe { SendMessageW(hwnd, LB_GETCOUNT, 0, 0) };
     if count < 0 || index >= count as usize {
@@ -1166,26 +1164,27 @@ fn execute_selected() {
     }
 }
 
-/// Hide first, restore the original target, then queue normal snippet injection.
 fn execute_index(list_index: usize) {
-    // SAFETY: list/search procedures run on the main thread; shutdown is handled
-    // by tolerating a missing App instance.
+    // SAFETY: list/search procedures run on the main thread.
     let Some(app) = (unsafe { crate::app::try_app_mut() }) else {
         return;
     };
     let target = app.popup.target();
-    let Some(snippet_index) = app.popup.item(list_index) else {
+    let Some(kind) = app.popup.visible_item(list_index).map(|item| item.kind) else {
         return;
     };
     app.popup.hide();
     if !target.is_null() {
-        // SAFETY: target is the valid injection window selected by App when the
-        // picker opened.  SetForegroundWindow also tolerates a stale handle.
+        // SAFETY: target was selected by App and SetForegroundWindow tolerates a
+        // stale handle; injection revalidates it on the worker.
         unsafe {
             SetForegroundWindow(target);
         }
     }
-    app.inject_snippet(snippet_index, target);
+    match kind {
+        ItemKind::Snippet(index) => app.inject_snippet(index, target),
+        ItemKind::History(id) => app.inject_history(id, target),
+    }
 }
 
 fn edit_selected() {
@@ -1194,25 +1193,83 @@ fn edit_selected() {
     }
 }
 
-/// Hide before entering the future App editor API, as required by App's
-/// main-thread/re-entrancy contract.  Editing never reactivates the inject target.
 fn edit_index(list_index: usize) {
-    // SAFETY: this command originates in a main-thread popup control procedure.
+    // SAFETY: this command originates in a main-thread popup procedure.
     let Some(app) = (unsafe { crate::app::try_app_mut() }) else {
         return;
     };
-    let Some(snippet_index) = app.popup.item(list_index) else {
+    // History rows deliberately have no snippet edit action.
+    let Some(snippet_index) = app.popup.snippet_index(list_index) else {
         return;
     };
     app.popup.hide();
     app.open_snippet_editor(Some(snippet_index));
 }
 
-fn open_new_snippet() {
+fn delete_selected() {
+    // Resolve the row before borrowing App again: selected_row itself performs a
+    // short try_app_mut access and must not be nested inside another App borrow.
+    let Some(row) = selected_row() else {
+        return;
+    };
+    // SAFETY: this command originates in a main-thread list procedure.
+    let Some(app) = (unsafe { crate::app::try_app_mut() }) else {
+        return;
+    };
+    let Some(ItemKind::History(id)) = app.popup.visible_item(row).map(|item| item.kind) else {
+        return;
+    };
+    if app.history.remove(id) {
+        app.popup.remove_history(id);
+    }
+}
+
+fn clear_history() {
     // SAFETY: this command originates in a main-thread button notification.
     let Some(app) = (unsafe { crate::app::try_app_mut() }) else {
         return;
     };
+    app.history.clear();
+    app.popup.clear_history();
+}
+
+fn open_quick_menu() {
+    // SAFETY: this command originates in a main-thread button notification.
+    let Some(app) = (unsafe { crate::app::try_app_mut() }) else {
+        return;
+    };
+    let mut rect = util::rect(0, 0, 0, 0);
+    // SAFETY: rect is writable and the menu button is a live child window.
+    unsafe {
+        GetWindowRect(app.popup.controls.menu_button, &mut rect);
+    }
     app.popup.hide();
-    app.open_snippet_editor(None);
+    app.queue_menu(windows_sys::Win32::Foundation::POINT {
+        x: rect.left,
+        y: rect.bottom,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previews_are_single_line_and_preserve_searchable_original() {
+        let snippet = vibekey_core::Snippet::new("1", "问候", "第一行\n第二行\t结束");
+        let item = PopupItem::from_snippet(3, &snippet);
+        assert_eq!(item.preview, "第一行 第二行 结束");
+        assert!(matches_query(&item, "第二行"));
+        assert!(matches_query(&item, "alt+1 问候"));
+        assert!(!matches_query(&item, "缺失"));
+    }
+
+    #[test]
+    fn history_search_uses_text_beyond_the_visible_preview() {
+        let text = format!("{}needle", "x".repeat(PREVIEW_CHARS + 20));
+        let item = PopupItem::from_history(7, &text);
+        assert!(item.preview.chars().count() <= PREVIEW_CHARS);
+        assert!(matches_query(&item, "needle"));
+        assert_eq!(item.kind, ItemKind::History(7));
+    }
 }

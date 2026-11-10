@@ -40,6 +40,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::clipboard;
+use crate::history::HistoryControl;
 use crate::util::WM_APP_INJECT_DONE;
 
 const ALT_RELEASE_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -50,8 +51,10 @@ const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(250);
 
 /// One injection request.
 pub struct InjectJob {
-    /// Un-expanded snippet template; the worker expands it at injection time.
+    /// Snippet template, or literal text for a clipboard-history entry.
     pub template: String,
+    /// Snippets expand variables; clipboard history must always paste verbatim.
+    pub expand_template: bool,
     pub send_enter: bool,
     /// Target window as a raw handle value; stored as isize because HWND is not
     /// Send and the job crosses the thread boundary.
@@ -122,7 +125,7 @@ impl Drop for InjectHandle {
 }
 
 /// Start the injection worker.
-pub fn start(main_hwnd: HWND) -> InjectHandle {
+pub fn start(main_hwnd: HWND, history_control: Arc<HistoryControl>) -> InjectHandle {
     let shared = Arc::new(InjectShared {
         main_hwnd: AtomicIsize::new(crate::util::hwnd_to_isize(main_hwnd)),
         last_error: Mutex::new(None),
@@ -133,7 +136,7 @@ pub fn start(main_hwnd: HWND) -> InjectHandle {
     let worker_shutdown = Arc::clone(&shutdown);
     let join = std::thread::Builder::new()
         .name("vibekey-inject".to_string())
-        .spawn(move || worker(worker_shared, worker_shutdown, receiver))
+        .spawn(move || worker(worker_shared, worker_shutdown, history_control, receiver))
         .ok();
     InjectHandle {
         sender: Some(sender),
@@ -146,11 +149,12 @@ pub fn start(main_hwnd: HWND) -> InjectHandle {
 fn worker(
     shared: Arc<InjectShared>,
     shutdown: Arc<AtomicBool>,
+    history_control: Arc<HistoryControl>,
     receiver: mpsc::Receiver<InjectJob>,
 ) {
     loop {
         match receiver.recv_timeout(Duration::from_millis(200)) {
-            Ok(job) => run_job(&shared, &shutdown, job),
+            Ok(job) => run_job(&shared, &shutdown, &history_control, job),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if shutdown.load(Ordering::Acquire) {
                     break;
@@ -161,8 +165,13 @@ fn worker(
     }
 }
 
-fn run_job(shared: &InjectShared, shutdown: &AtomicBool, job: InjectJob) {
-    let result = deliver(shutdown, &job);
+fn run_job(
+    shared: &InjectShared,
+    shutdown: &AtomicBool,
+    history_control: &HistoryControl,
+    job: InjectJob,
+) {
+    let result = deliver(shutdown, history_control, &job);
     match &result {
         Ok(()) => {}
         Err(error) => {
@@ -186,21 +195,28 @@ fn post(shared: &InjectShared, message: u32, wparam: usize, lparam: isize) {
     }
 }
 
-fn deliver(shutdown: &AtomicBool, job: &InjectJob) -> Result<(), String> {
-    // Expand here rather than on the main thread: the clipboard read for the
-    // {clipboard} token then sees the clipboard as restored by the previous job
-    // instead of the previous snippet text, and the main thread never blocks on
-    // the clipboard.
-    let clipboard_text = clipboard::read_text();
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    let host = std::env::var("COMPUTERNAME").unwrap_or_default();
-    let context = ExpandContext {
-        now: chrono::Local::now(),
-        clipboard: clipboard_text.as_deref(),
-        user: &user,
-        host: &host,
+fn deliver(
+    shutdown: &AtomicBool,
+    history_control: &HistoryControl,
+    job: &InjectJob,
+) -> Result<(), String> {
+    // Expand snippets here rather than on the main thread: {clipboard} then sees
+    // the restored original rather than the previous snippet. History entries
+    // bypass expansion so copied text such as "{date}" is pasted verbatim.
+    let text = if job.expand_template {
+        let clipboard_text = clipboard::read_text();
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let host = std::env::var("COMPUTERNAME").unwrap_or_default();
+        let context = ExpandContext {
+            now: chrono::Local::now(),
+            clipboard: clipboard_text.as_deref(),
+            user: &user,
+            host: &host,
+        };
+        expand(&job.template, &context)
+    } else {
+        job.template.clone()
     };
-    let text = expand(&job.template, &context);
     if text.is_empty() && !job.send_enter {
         return Err("片段内容为空".to_string());
     }
@@ -259,7 +275,7 @@ fn deliver(shutdown: &AtomicBool, job: &InjectJob) -> Result<(), String> {
     }
 
     match job.input_method {
-        InputMethod::Paste => match paste(job, &text) {
+        InputMethod::Paste => match paste(history_control, job, &text) {
             Ok(()) => Ok(()),
             Err(error) => {
                 log::warn!("clipboard paste failed ({error}); falling back to typing");
@@ -462,7 +478,7 @@ fn press_control_v() -> bool {
 /// The restore is serialised inside the worker: the next job only starts after
 /// the previous one has restored the original clipboard text, so a second snippet
 /// never saves the text of the first snippet as "the original".
-fn paste(job: &InjectJob, text: &str) -> Result<(), String> {
+fn paste(history_control: &HistoryControl, job: &InjectJob, text: &str) -> Result<(), String> {
     // Inspect the clipboard once, before changing it: plain text can be restored
     // byte for byte, everything else (files, images, HTML, RTF) must be left
     // alone, in which case the worker types the snippet instead.
@@ -484,7 +500,7 @@ fn paste(job: &InjectJob, text: &str) -> Result<(), String> {
         }
     }
 
-    if !clipboard::write_text(text) {
+    if !history_control.internal_write(|| clipboard::write_text(text)) {
         return Err("无法写入剪贴板".to_string());
     }
     std::thread::sleep(Duration::from_millis(50));
@@ -501,11 +517,11 @@ fn paste(job: &InjectJob, text: &str) -> Result<(), String> {
         // Give slow target applications time to read the clipboard before it is
         // rewritten.
         std::thread::sleep(CLIPBOARD_RESTORE_DELAY);
-        let restored = match saved_text.as_deref() {
+        let restored = history_control.internal_write(|| match saved_text.as_deref() {
             Some(saved) => clipboard::write_text(saved),
             // The clipboard was empty before the paste; restore that state.
             None => clipboard::clear(),
-        };
+        });
         if !restored {
             // A failed restore must not turn a successful injection into an
             // error; it is only reported in the log.

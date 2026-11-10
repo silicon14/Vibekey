@@ -7,8 +7,8 @@
 
 use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, OpenClipboard,
-    SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    GetClipboardSequenceNumber, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -130,32 +130,83 @@ pub fn read_text() -> Option<String> {
     result
 }
 
-/// Empty the clipboard again, used to restore the "no clipboard content" state
-/// after a paste. Returns false when the clipboard could not be opened.
-pub fn clear() -> bool {
-    if !open_clipboard(std::ptr::null_mut()) {
-        return false;
+/// Non-blocking variant for WM_CLIPBOARDUPDATE. A copy notification normally
+/// arrives after the source has closed the clipboard; if another process still
+/// owns it, skipping this event is preferable to sleeping in the UI thread.
+/// Rich formats may accompany CF_UNICODETEXT: history intentionally keeps only
+/// their plain-text representation and never clones the other payloads.
+pub fn read_text_for_history() -> Option<String> {
+    // SAFETY: a null owner is permitted and no other clipboard call is made if
+    // OpenClipboard fails. Success is paired with exactly one CloseClipboard.
+    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+        return None;
     }
-    // SAFETY: the clipboard is open and is closed exactly once below.
-    let ok = unsafe {
-        let emptied = EmptyClipboard() != 0;
+    // SAFETY: the clipboard is open on this thread and is closed exactly once.
+    unsafe {
+        let text = read_text_locked();
         CloseClipboard();
-        emptied
-    };
-    ok
+        text
+    }
 }
 
-/// Replace the clipboard text. Returns false when the clipboard could not be
-/// written (it stays unchanged in that case).
-pub fn write_text(text: &str) -> bool {
-    if !open_clipboard(std::ptr::null_mut()) {
-        return false;
+/// Result of a clipboard mutation. `sequence` is queried while this thread
+/// still owns the open clipboard, so another process cannot slip its own write
+/// between SetClipboardData/EmptyClipboard and sequence attribution.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClipboardMutation {
+    pub(crate) succeeded: bool,
+    pub(crate) sequence: Option<u32>,
+}
+
+impl ClipboardMutation {
+    fn failed() -> Self {
+        Self {
+            succeeded: false,
+            sequence: None,
+        }
     }
-    let mut ok = false;
+}
+
+/// Read the sequence while the clipboard is open. Other processes cannot open
+/// and replace it until the paired CloseClipboard has run.
+fn owned_sequence() -> Option<u32> {
+    // SAFETY: GetClipboardSequenceNumber has no preconditions. Calling it before
+    // CloseClipboard is what gives the value its ownership guarantee.
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    (sequence != 0).then_some(sequence)
+}
+
+/// Empty the clipboard again, used to restore the "no clipboard content" state.
+pub fn clear() -> ClipboardMutation {
+    if !open_clipboard(std::ptr::null_mut()) {
+        return ClipboardMutation::failed();
+    }
+    // SAFETY: the clipboard is open and is closed exactly once below. Sequence
+    // attribution happens before CloseClipboard while ownership is exclusive.
+    unsafe {
+        let mut outcome = ClipboardMutation::failed();
+        if EmptyClipboard() != 0 {
+            outcome.succeeded = true;
+            outcome.sequence = owned_sequence();
+        }
+        CloseClipboard();
+        outcome
+    }
+}
+
+/// Replace the clipboard text. A failed write can still have emptied the old
+/// clipboard; the returned sequence records that mutation as well.
+pub fn write_text(text: &str) -> ClipboardMutation {
+    if !open_clipboard(std::ptr::null_mut()) {
+        return ClipboardMutation::failed();
+    }
+    let mut outcome = ClipboardMutation::failed();
     // SAFETY: every global memory block is either handed to the clipboard or
-    // freed before this block ends, and the clipboard is closed below.
+    // freed before this block ends. The clipboard remains open until after all
+    // sequence reads, preventing another process from changing its ownership.
     unsafe {
         if EmptyClipboard() != 0 {
+            outcome.sequence = owned_sequence();
             let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
             let bytes = units.len() * std::mem::size_of::<u16>();
             let memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
@@ -172,7 +223,8 @@ pub fn write_text(text: &str) -> bool {
                     if handle.is_null() {
                         GlobalFree(memory);
                     } else {
-                        ok = true;
+                        outcome.succeeded = true;
+                        outcome.sequence = owned_sequence();
                     }
                 } else {
                     GlobalFree(memory);
@@ -181,5 +233,5 @@ pub fn write_text(text: &str) -> bool {
         }
         CloseClipboard();
     }
-    ok
+    outcome
 }

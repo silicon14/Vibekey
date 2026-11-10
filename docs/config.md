@@ -51,18 +51,21 @@ Windows 上配置文件位于应用数据目录：
 | `restore_clipboard` | 布尔 | `true` | 粘贴后是否恢复剪贴板原有内容。为 `true` 时：纯文本会完整恢复；剪贴板里是文件/图片/富文本（HTML/RTF 等）时程序**不覆盖剪贴板**，自动改用逐字符输入。为 `false` 时直接用剪贴板粘贴，原内容会被片段覆盖。 |
 | `start_with_windows` | 布尔 | `false` | 开机自启动。实际写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，托盘菜单「开机启动」会同步这个字段。 |
 | `ignore_apps` | 字符串数组 | `[]` | 在这些程序里不触发任何快捷键，按前台进程的 exe 文件名匹配，不区分大小写，例如 `["photoshop.exe"]`。空字符串条目会触发警告。 |
-| `[hotkeys]` | 表 | 见下 | 内置菜单的快捷键。 |
+| `[hotkeys]` | 表 | 见下 | 片段列表、剪贴板历史和配置菜单的快捷键。 |
 | `[sync]` | 表 | 见下 | WebDAV 同步设置。 |
 | `[[snippet]]` | 表数组 | 空 | 片段列表，数组顺序就是列表弹窗中的显示顺序。 |
 
-## `[hotkeys]`：内置菜单快捷键
+## `[hotkeys]`：内置功能快捷键
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `list` | 字符串 | Alt + 反引号 | 打开片段列表。默认值是 Alt 加反引号键（TOML 中也可写成 `alt+grave`），见下方语法示例。 |
 | `config` | 字符串 | `alt+backspace` | 打开配置菜单。 |
+| `history` | 字符串 | `alt+v` | 打开文本剪贴板历史。默认不使用 Win+V，以免覆盖 Windows 10/11 自带面板；手动改成 `win+v` 会与系统功能冲突。 |
 
-两个值都不能为空；为空是校验错误。它们不能和任何 `[[snippet]]` 的 `key` 冲突。
+三个值都不能为空；为空是校验错误。它们彼此不能重复，也不能和任何 `[[snippet]]` 的 `key` 冲突。旧配置缺少 `history` 时自动使用 `alt+v`。
+
+历史记录最多保留最近 50 条非空 Unicode 文本，重复内容移到最前。它只存在于内存中，退出即清除，不生成历史文件、不随 WebDAV 同步；图片、文件和富文本 payload 不会被复制到历史中。
 
 ### 快捷键语法
 
@@ -102,7 +105,7 @@ alt+grave    # 反引号的别名
 校验规则：
 
 - `key` 必须是上面 12 个槽位之一或空字符串，其他值报错。
-- 同一个 `key` 只能出现一次；和 `hotkeys.list` / `hotkeys.config` 冲突也报错。
+- 同一个 `key` 只能出现一次；和 `hotkeys.list` / `hotkeys.config` / `hotkeys.history` 冲突也报错。
 - `enabled = false` 的片段不参与上述冲突检查。
 - 没有 `key` 的片段（`key = ""`）不会和任何快捷键冲突。
 
@@ -151,7 +154,7 @@ alt+grave    # 反引号的别名
 
 | 情况 | 级别 |
 | --- | --- |
-| `hotkeys.list` / `hotkeys.config` 为空 | 错误 |
+| `hotkeys.list` / `hotkeys.config` / `hotkeys.history` 为空 | 错误 |
 | 快捷键解析失败（空、无修饰键、未知键） | 错误 |
 | 两个片段使用同一个 `key`，或片段与菜单快捷键冲突 | 错误 |
 | `snippet.key` 不是 12 个槽位之一 | 错误 |
@@ -208,6 +211,7 @@ ignore_apps = ["photoshop.exe"]
 [hotkeys]
 list = "alt+`"
 config = "alt+backspace"
+history = "alt+v"
 
 [sync]
 enabled = false

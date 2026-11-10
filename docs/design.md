@@ -63,7 +63,7 @@ SendInput(KEYEVENTF_UNICODE) 逐字符输入；打不开剪贴板时同样保守
 
 ### 4.1 原生图形界面与快速编辑
 
-设置中心分为片段库、输入与快捷键、同步与备份三个页面。片段弹窗支持搜索，F2、右键和按钮都可直接进入所选项的快速编辑。编辑器覆盖 Snippet 的名称、槽位、多行正文、send_enter 和 enabled，也覆盖全部全局行为与同步字段。
+设置中心分为片段库、输入与快捷键、同步与备份三个页面。片段弹窗支持搜索，F2 和右键可直接进入所选项的快速编辑。编辑器覆盖 Snippet 的名称、槽位、多行正文、send_enter 和 enabled，也覆盖全部全局行为、三个内置功能热键与同步字段。
 
 片段控件先修改窗口内的 Config 工作副本；只有“应用”或“保存并关闭”才统一校验 Keymap、检查文件外部修改并原子写入。取消不会写入半成品。应用后通过 WM_APP_RELOAD 复用既有热重载路径，因此钩子、同步线程和弹窗不会各自维护一份配置。界面共享 ui::theme 的字体、颜色和自绘列表，不增加 GUI 依赖或 Win8+ API。
 
@@ -75,9 +75,24 @@ SendInput(KEYEVENTF_UNICODE) 逐字符输入；打不开剪贴板时同样保守
 依赖 DirectComposition、Direct Manipulation 等 Win8+ 技术，并要求最新 stable Rust 和较多 GPU/DirectWrite 依赖。
 这与 Vibekey 的 Win7 x86/x64、rust-version 1.77、便携小体积及无额外 GUI 框架约束冲突，因此不迁移到 GPUI。
 
-Alt+反引号弹窗改用 480×390 逻辑像素的紧凑设计（44 像素行高、最多 6 行）。透明效果使用 Win7 已存在的
-WS_EX_LAYERED + SetLayeredWindowAttributes，242/255 统一 Alpha；不支持时移除分层样式并保持不透明。
-这是半透明而非背景模糊，优先保证中文、快捷键和小字的可读性。
+弹窗进一步压缩为 460 逻辑像素宽、34 像素单行、最多 6 行；移除标题、结果数和底栏，把完整配置菜单放进搜索栏右侧的 ☰。
+名称与内容预览在同一行省略显示，多行原文只在展示层折叠，注入仍使用完整文本。窗口完成最终 Resize/Focus 后显式复位
+LB_SETTOPINDEX=0，避免 ListBox 从第二行开始显示。透明效果使用 Win7 已存在的 WS_EX_LAYERED +
+SetLayeredWindowAttributes，242/255 统一 Alpha；不支持时移除分层样式并保持不透明。这是半透明而非背景模糊。
+原生菜单通过 WM_APP_SHOW_MENU 排队，TrackPopupMenu 前后分别短借用 App，不在模态菜单期间保留 &mut App。
+
+### 4.3 内存文本剪贴板历史
+
+Alt+V 与 Alt+反引号复用同一个紧凑选择器，默认不占用 Windows 10/11 的系统 Win+V；hotkeys.history 可在设置中修改。
+主窗口通过 AddClipboardFormatListener/WM_CLIPBOARDUPDATE 读取 CF_UNICODETEXT，保存最近 50 条，重复文本置顶，
+支持全文搜索、Enter/单击粘贴、Delete 删除和清空。条目使用稳定 u64 ID，执行前重新解析，不能因新复制或删除而错位。
+历史只在内存中保存，退出清空，不写文件、不随 WebDAV 同步；图片/文件/富文本 payload 不做快照，只保存附带的 Unicode 文本。
+
+注入线程的片段写入、历史写入和原文恢复不能污染历史。HistoryControl 用互斥门串行化内部写入与捕获；主线程 try_lock，
+在锁内执行 sequence 检查 → 非阻塞文本读取 → sequence 复核，避免“检查后读到内部文本”的 TOCTOU。内部写入函数在
+CloseClipboard 前、仍独占剪贴板时返回本次 GetClipboardSequenceNumber；只登记这个确定归属的序列，不读取操作结束后的任意最新值，
+因此随后发生的外部写入不会被误标为内部操作。历史注入 expand_template=false，
+因此复制的 {date} 等字符串按原文粘贴。主窗口消息不再交给设置对话框的 IsDialogMessageW，保证设置页打开时仍能收到剪贴板通知。
 
 ### 5. 密码与同步
 
@@ -116,6 +131,7 @@ Rust 1.78 起，普通 *-pc-windows-* 目标的 std 要求 Windows 10；官方�
     [hotkeys]
     list = "alt+`"
     config = "alt+backspace"
+    history = "alt+v"
 
     [sync]
     enabled = false
