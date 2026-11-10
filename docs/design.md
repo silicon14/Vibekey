@@ -115,6 +115,7 @@ WebDAV 登录密码和独立配置加密密码都不写入 config.toml：Windows
   避免后台同步与设置页并发修改时误删新轮换。关闭加密需保留密码完成显式解密迁移。
 
 HTTP：ureq + rustls + 内置 webpki 根证书（不依赖系统证书库，规避 Win7 根证书过期问题），Basic 认证。
+可选 certificate_sha256 仅对指定自签名证书做 DER 指纹固定，同时继续验证 TLS1.2/1.3 握手签名；不接受所有证书，也不影响其它服务器。
 内容加密不保护 Basic 请求头、URL/元数据，不防合法旧密文回滚，因此仍需 HTTPS。
 
 ### 6. Win7 构建
@@ -149,6 +150,7 @@ Rust 1.78 起，普通 *-pc-windows-* 目标的 std 要求 Windows 10；官方�
     sync_on_change = true
     backup_on_conflict = true
     encrypt = true
+    certificate_sha256 = ""
     timeout_secs = 20
 
     [[snippet]]

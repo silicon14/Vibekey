@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use vibekey_core::crypto::{decrypt_config, validate_password, CryptoError};
 use vibekey_core::keymap::SLOT_KEYS;
-use vibekey_core::sync::{UreqWebDav, WebDav};
+use vibekey_core::sync::{CertificateFingerprint, UreqWebDav, WebDav};
 use vibekey_core::{ActivationMode, Config, InputMethod, Keymap, SecretKind, SecretStore, Snippet};
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -76,6 +76,7 @@ const ID_ENCRYPT: i32 = 411;
 const ID_ENCRYPTION_PASSWORD: i32 = 412;
 const ID_CLEAR_ENCRYPTION_PASSWORD: i32 = 413;
 const ID_ENCRYPTION_PASSWORD_STATE: i32 = 414;
+const ID_CERTIFICATE_SHA256: i32 = 415;
 
 const ID_INPUT_METHOD: i32 = 500;
 const ID_ACTIVATION: i32 = 501;
@@ -172,7 +173,7 @@ struct SyncControls {
     sync_on_change: HWND,
     backup: HWND,
     test: HWND,
-    test_hint: HWND,
+    certificate_fingerprint: HWND,
 }
 
 struct SettingsState {
@@ -709,7 +710,17 @@ unsafe fn create_sync_controls(state: &mut SettingsState) {
         ID_BACKUP,
     );
     c.test = button(page, "测试连接", ID_TEST, false);
-    c.test_hint = small_label(page, "测试会验证加密密码；新密码在成功同步后完成替换。", -1);
+    c.certificate_fingerprint = edit(
+        page,
+        &config.certificate_sha256,
+        ID_CERTIFICATE_SHA256,
+        false,
+    );
+    cue_banner(
+        c.certificate_fingerprint,
+        "可选：自签名证书 SHA-256 指纹（64 位十六进制）",
+    );
+    theme::set_font(c.certificate_fingerprint, theme::mono_font());
 }
 
 fn window_text(hwnd: HWND) -> String {
@@ -1303,8 +1314,8 @@ fn layout_behavior_compact(c: &BehaviorControls, width: i32, height: i32) {
 fn layout_sync(state: &mut SettingsState, height: i32) {
     let c = &state.sync;
     let width = page_width(state, PAGE_SYNC);
-    if height < util::scale(440) {
-        layout_sync_compact(c, width, height);
+    if height < util::scale(480) {
+        layout_sync_compact(c, width);
         return;
     }
     let m = util::scale(22);
@@ -1314,7 +1325,7 @@ fn layout_sync(state: &mut SettingsState, height: i32) {
     let right = m + column + gap;
     // SAFETY: the hint is a live child; restore it after a compact layout.
     unsafe {
-        ShowWindow(c.test_hint, SW_SHOW);
+        ShowWindow(c.certificate_fingerprint, SW_SHOW);
     }
     let test_width = util::scale(108);
     move_window(
@@ -1411,28 +1422,17 @@ fn layout_sync(state: &mut SettingsState, height: i32) {
     );
     move_window(c.backup, m, util::scale(396), inner, util::scale(24));
     move_window(
-        c.test_hint,
+        c.certificate_fingerprint,
         m,
-        height - util::scale(24),
+        height - util::scale(30),
         inner,
-        util::scale(20),
+        util::scale(30),
     );
-    // SAFETY: the hint is a live child; shorter forms use the compact layout.
-    unsafe {
-        ShowWindow(
-            c.test_hint,
-            if height >= util::scale(460) {
-                SW_SHOW
-            } else {
-                SW_HIDE
-            },
-        );
-    }
 }
 
 /// Compact sync form: the test action moves beside the enable checkbox so it
 /// cannot collide with the two lower option checkboxes.
-fn layout_sync_compact(c: &SyncControls, width: i32, height: i32) {
+fn layout_sync_compact(c: &SyncControls, width: i32) {
     let m = util::scale(20);
     let inner = width - m * 2;
     let gap = util::scale(16);
@@ -1527,24 +1527,18 @@ fn layout_sync_compact(c: &SyncControls, width: i32, height: i32) {
     move_window(
         c.sync_on_change,
         m,
-        util::scale(288),
+        util::scale(266),
         inner,
         util::scale(20),
     );
-    move_window(c.backup, m, util::scale(310), inner, util::scale(20));
-    let show_hint = height >= util::scale(400);
+    move_window(c.backup, m, util::scale(288), inner, util::scale(20));
     move_window(
-        c.test_hint,
+        c.certificate_fingerprint,
         m,
-        height - util::scale(24),
+        util::scale(312),
         inner,
-        util::scale(20),
+        util::scale(26),
     );
-    // SAFETY: the hint is a live child; hiding it is preferable to overlapping
-    // the backup checkbox on especially short windows.
-    unsafe {
-        ShowWindow(c.test_hint, if show_hint { SW_SHOW } else { SW_HIDE });
-    }
 }
 
 fn select_page(state: &mut SettingsState, page: usize) {
@@ -1981,8 +1975,16 @@ unsafe extern "system" fn settings_proc(
                 }
                 ID_SYNC_ENABLED | ID_SYNC_ON_CHANGE | ID_BACKUP | ID_ENCRYPT
                 | ID_RESTORE_CLIPBOARD | ID_AUTOSTART => mark_dirty(state),
-                ID_URL | ID_USER | ID_INTERVAL | ID_TIMEOUT | ID_HOLD_MS | ID_LIST_HOTKEY
-                | ID_CONFIG_HOTKEY | ID_HISTORY_HOTKEY | ID_IGNORE_APPS
+                ID_URL
+                | ID_USER
+                | ID_INTERVAL
+                | ID_TIMEOUT
+                | ID_HOLD_MS
+                | ID_LIST_HOTKEY
+                | ID_CONFIG_HOTKEY
+                | ID_HISTORY_HOTKEY
+                | ID_IGNORE_APPS
+                | ID_CERTIFICATE_SHA256
                     if notification == EN_CHANGE =>
                 {
                     mark_dirty(state)
@@ -2474,6 +2476,9 @@ fn save(state: &mut SettingsState) -> bool {
     config.sync.sync_on_change = checked(state.sync.sync_on_change);
     config.sync.backup_on_conflict = checked(state.sync.backup);
     config.sync.encrypt = checked(state.sync.encrypt);
+    config.sync.certificate_sha256 = window_text(state.sync.certificate_fingerprint)
+        .trim()
+        .to_string();
     config.start_with_windows = checked(state.behavior.autostart);
     config.restore_clipboard = checked(state.behavior.restore_clipboard);
     config.input_method = if combo_selection(state.behavior.input_method) == 0 {
@@ -2537,6 +2542,18 @@ fn save(state: &mut SettingsState) -> bool {
             select_page(state, PAGE_SYNC);
             return false;
         }
+    }
+
+    if !config.sync.certificate_sha256.is_empty()
+        && CertificateFingerprint::parse(&config.sync.certificate_sha256).is_err()
+    {
+        util::message_box_error(
+            state.hwnd,
+            "证书指纹必须是 64 位十六进制字符，可包含冒号、空格或 SHA256: 前缀。",
+            "保存失败",
+        );
+        select_page(state, PAGE_SYNC);
+        return false;
     }
 
     let encryption_password = window_text(state.sync.encryption_password);
@@ -2834,6 +2851,18 @@ fn test_connection(state: &mut SettingsState) {
         .parse::<u64>()
         .unwrap_or(20)
         .max(1);
+    let certificate_sha256 = window_text(state.sync.certificate_fingerprint)
+        .trim()
+        .to_string();
+    if !certificate_sha256.is_empty() && CertificateFingerprint::parse(&certificate_sha256).is_err()
+    {
+        util::message_box_warning(
+            state.hwnd,
+            "证书指纹必须是 64 位十六进制字符，可包含冒号、空格或 SHA256: 前缀。",
+            "测试连接",
+        );
+        return;
+    }
 
     let disable_encryption_allowed =
         vibekey_core::sync::last_state(&state.config_path).remote_encrypted == Some(true);
@@ -2844,34 +2873,41 @@ fn test_connection(state: &mut SettingsState) {
     let spawned = std::thread::Builder::new()
         .name("vibekey-test".to_string())
         .spawn(move || {
-            let dav = UreqWebDav::new(&username, &password, Duration::from_secs(timeout));
-            let (ok, message) = match dav.get(&url) {
-                Ok(Some(remote)) if remote.encrypted => encryption_test_result(
-                    &remote.body,
-                    &encryption_passwords,
-                    encryption_enabled,
-                    disable_encryption_allowed,
-                ),
-                Ok(Some(remote)) => (
-                    true,
-                    if encryption_enabled {
-                        format!(
-                            "连接成功；远端当前是 {} 字节的明文配置，下次同步会加密迁移。",
-                            remote.body.len()
-                        )
-                    } else {
-                        format!("连接成功，远端配置文件 {} 字节。", remote.body.len())
-                    },
-                ),
-                Ok(None) => (
-                    true,
-                    if encryption_enabled {
-                        "连接成功，远端文件尚不存在；首次同步会加密上传。".to_string()
-                    } else {
-                        "连接成功，但远端文件还不存在（首次同步时会上传）。".to_string()
-                    },
-                ),
-                Err(error) => (false, format!("连接失败：{error}")),
+            let (ok, message) = match UreqWebDav::new_with_fingerprint(
+                &username,
+                &password,
+                Duration::from_secs(timeout),
+                &certificate_sha256,
+            ) {
+                Err(error) => (false, format!("证书指纹配置无效：{error}")),
+                Ok(dav) => match dav.get(&url) {
+                    Ok(Some(remote)) if remote.encrypted => encryption_test_result(
+                        &remote.body,
+                        &encryption_passwords,
+                        encryption_enabled,
+                        disable_encryption_allowed,
+                    ),
+                    Ok(Some(remote)) => (
+                        true,
+                        if encryption_enabled {
+                            format!(
+                                "连接成功；远端当前是 {} 字节的明文配置，下次同步会加密迁移。",
+                                remote.body.len()
+                            )
+                        } else {
+                            format!("连接成功，远端配置文件 {} 字节。", remote.body.len())
+                        },
+                    ),
+                    Ok(None) => (
+                        true,
+                        if encryption_enabled {
+                            "连接成功，远端文件尚不存在；首次同步会加密上传。".to_string()
+                        } else {
+                            "连接成功，但远端文件还不存在（首次同步时会上传）。".to_string()
+                        },
+                    ),
+                    Err(error) => (false, format!("连接失败：{error}")),
+                },
             };
             if let Ok(mut slot) = result_slot.lock() {
                 *slot = Some((ok, message));

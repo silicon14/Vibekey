@@ -27,6 +27,7 @@ pub struct SyncSettings {
     pub interval_minutes: u32,
     pub backup_on_conflict: bool,
     pub encrypt: bool,
+    pub certificate_sha256: String,
     pub timeout_secs: u64,
     pub config_path: PathBuf,
 }
@@ -40,6 +41,7 @@ impl SyncSettings {
             interval_minutes: config.sync.interval_minutes,
             backup_on_conflict: config.sync.backup_on_conflict,
             encrypt: config.sync.encrypt,
+            certificate_sha256: config.sync.certificate_sha256.clone(),
             timeout_secs: config.sync.timeout_secs,
             config_path,
         }
@@ -351,7 +353,26 @@ fn run_sync(
     };
 
     let timeout = Duration::from_secs(settings.timeout_secs.max(1));
-    let dav = UreqWebDav::new(&settings.username, &password, timeout);
+    let dav = match UreqWebDav::new_with_fingerprint(
+        &settings.username,
+        &password,
+        timeout,
+        &settings.certificate_sha256,
+    ) {
+        Ok(dav) => dav,
+        Err(error) => {
+            finish(
+                shared,
+                SyncResult {
+                    manual,
+                    ok: false,
+                    pulled: false,
+                    message: format!("证书指纹配置无效：{error}"),
+                },
+            );
+            return;
+        }
+    };
     let engine = SyncEngine::new(
         &dav,
         settings.url.clone(),

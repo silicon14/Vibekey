@@ -54,11 +54,12 @@ pub fn sync_once_protected(
     let state_path = SyncState::path_for(config_path);
     let mut state = SyncState::load(&state_path);
 
-    let dav = UreqWebDav::new(
+    let dav = UreqWebDav::new_with_fingerprint(
         &sync.username,
         password.unwrap_or(""),
         Duration::from_secs(sync.timeout_secs),
-    );
+        &sync.certificate_sha256,
+    )?;
     let engine = SyncEngine::new(&dav, &sync.url, config_path, sync.backup_on_conflict)
         .with_protection(protection);
 

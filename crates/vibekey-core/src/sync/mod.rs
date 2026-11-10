@@ -15,4 +15,4 @@ pub use engine::{
     WebDav,
 };
 pub use run::{last_state, sync_once, sync_once_protected};
-pub use webdav::{parent_url, UreqWebDav};
+pub use webdav::{parent_url, CertificateFingerprint, UreqWebDav};

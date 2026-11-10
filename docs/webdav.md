@@ -33,6 +33,7 @@ Vibekey 可以把配置文件 `config.toml` 通过标准 WebDAV 同步到自己�
     sync_on_change = true
     backup_on_conflict = true
     encrypt = true
+    certificate_sha256 = ""
     timeout_secs = 20
 
 | 字段 | 默认值 | 说明 |
@@ -44,6 +45,7 @@ Vibekey 可以把配置文件 `config.toml` 通过标准 WebDAV 同步到自己�
 | `sync_on_change` | `true` | 保存配置后立即同步一次。 |
 | `backup_on_conflict` | `true` | 双方都修改时，先把远端内容备份到备份文件再覆盖；加密开启后备份也为密文。 |
 | `encrypt` | `false` | 是否用独立同步密码加密认证远端配置。旧配置缺字段时保持兼容的明文模式。 |
+| `certificate_sha256` | 空 | 可选的指定自签名证书 SHA-256 指纹；留空使用正常 CA + 主机名校验。 |
 | `timeout_secs` | `20` | 连接/读/写超时（秒），必须大于 0。 |
 
 WebDAV 登录密码和配置加密密码**都不在** `config.toml` 里，见下文“密码与安全”。剪贴板历史仅保存在本机内存中，也不在此文件的同步范围内；退出后历史即清空。
@@ -99,6 +101,18 @@ WebDAV 登录密码和配置加密密码**都不在** `config.toml` 里，见下
 `401 Unauthorized`（标准实现应同时带 `WWW-Authenticate: Basic realm="..."` 挑战）
 即判定认证失败，不会自动重试。由于用户名/密码只是 Base64 编码后随请求头发送，
 **正式使用必须走 HTTPS**。Digest/OAuth/令牌认证暂不支持。`sync.encrypt` 只加密配置正文，不会加密 HTTP 请求头，因此不能隐藏 Basic 用户名/密码，也不能替代 HTTPS。
+
+### 自签名证书（指纹固定）
+
+默认不接受自签名证书，也不提供“接受所有证书”的全局开关。私有服务器确需自签名时，可在设置页或 `[sync]` 中填写实际证书的
+SHA-256 指纹（DER 编码证书的哈希，不是公钥哈希）：
+
+    certificate_sha256 = "51EEC0BED086FF4A7A5DF490E4AB60EF2F5362E9E23E312BD767F3F24AFDB9AB"
+
+填后仅接受完全匹配的证书，替代该连接的 CA 链、主机名和有效期检查；TLS1.2/1.3 握手签名仍由 rustls 验证，错误指纹或换证书会失败。
+这意味着指纹是唯一的证书信任锚，请自行控制证书更换周期，不要长期使用不再信任的证书。
+指纹模式还会禁止 HTTPS→HTTP 重定向，防止最后一跳明文降级；重定向到使用不同证书的 HTTPS 主机同样会失败。
+指纹公开且不是密码，可以同步到其它机器，但应通过可信渠道核对，不能直接把网络中间人提供的指纹当作可信值。留空则恢复默认严格校验。
 
 ## 三、同步语义
 
@@ -219,7 +233,8 @@ WebDAV 登录密码和配置加密密码**都不在** `config.toml` 里，见下
 - HTTP 下密文不含可搜索片段、随机密文二次同步无 PUT、新机器解密且保留本地策略；
 - 错误密码、密文篡改、加密后明文 downgrade 全部失败关闭；
 - 旧明文迁移、加密冲突备份、新/旧密码轮换和显式关闭加密；
-- 加密 412 fresh GET 解密重试，以及同明文随机重加密后的 UpToDate/no-extra-PUT。
+- 加密 412 fresh GET 解密重试，以及同明文随机重加密后的 UpToDate/no-extra-PUT；
+- 真实自签名 TLS 握手：默认拒绝、错误指纹拒绝、正确指纹成功（证书主机名与 IP 故意不匹配）。
 
 测试只访问 `127.0.0.1`，不会连接任何外部服务器。
 
@@ -245,6 +260,7 @@ WebDAV 登录密码和配置加密密码**都不在** `config.toml` 里，见下
     username = "me"
     interval_minutes = 0
     encrypt = true
+    certificate_sha256 = ""
     timeout_secs = 10
 
 在设置窗口输入 WebDAV 密码 `secret` 和另一个至少 8 字符的配置加密密码，点“测试连接”，再“立即同步”。

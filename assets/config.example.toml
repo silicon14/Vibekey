@@ -75,6 +75,11 @@ backup_on_conflict = true
 # 注意：HTTP 仍会暴露 WebDAV Basic 登录凭据，正式使用仍建议 HTTPS。
 encrypt = true
 
+# 可选：信任一张指定的自签名服务器证书，而不是全局关闭证书校验。
+# 填该证书 DER 的 SHA-256（64 位十六进制，可用冒号分隔），留空使用正常 CA + 主机名校验。
+# 指纹不是密码，可以同步；换证书后必须更新。示例：51EEC0BED086FF4A7A5DF490E4AB60EF2F5362E9E23E312BD767F3F24AFDB9AB
+certificate_sha256 = ""
+
 # 网络超时（秒），必须大于 0。
 timeout_secs = 20
 

@@ -350,6 +350,7 @@ fn sync_config(dav: &MockDav, remote_path: &str) -> SyncConfig {
         sync_on_change: true,
         backup_on_conflict: true,
         encrypt: false,
+        certificate_sha256: String::new(),
         timeout_secs: 5,
     }
 }

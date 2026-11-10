@@ -84,6 +84,9 @@ pub struct SyncConfig {
     /// Encrypt and authenticate the configuration before uploading it. The
     /// separate encryption password is kept in the platform secret store.
     pub encrypt: bool,
+    /// Optional SHA-256 fingerprint of a specific self-signed server
+    /// certificate. Empty retains normal WebPKI CA and hostname validation.
+    pub certificate_sha256: String,
     pub timeout_secs: u64,
 }
 
@@ -97,6 +100,7 @@ impl Default for SyncConfig {
             sync_on_change: true,
             backup_on_conflict: true,
             encrypt: false,
+            certificate_sha256: String::new(),
             timeout_secs: 20,
         }
     }

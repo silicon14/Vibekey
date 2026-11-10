@@ -9,13 +9,13 @@
 
 - **项目是什么**：Vibekey 是一个常驻托盘的 Windows 小工具。按住 Alt 后按数字键，把预设文字直接输入当前窗口；
   Alt+反引号打开单行片段列表，Alt+V 打开内存文本剪贴板历史，Alt+Backspace 打开配置菜单；配置是纯文本 TOML；支持 WebDAV 同步。
-- **当前状态**：功能已完整实现，源码在仓库里；core 有 46 个单元测试 + 17 个 WebDAV 集成测试全绿；
+- **当前状态**：功能已完整实现，源码在仓库里；core 有 49 个单元测试 + 18 个 WebDAV/TLS 集成测试全绿；
   Win7 x64/i686 的 exe 已用 Linux 交叉编译产出，PE 头/导入表已做静态校验。
 - **真机验证进度**（2026-11-06，Windows 11 26200 x64）：已确认启动 / 托盘图标 / 右键菜单 /
   双击设置窗口 / 单实例 / 退出 / 真键盘 Alt+1 插入全部正常，记录见 `docs/testing-win11-2026-11-06.md`。
   仍待验证：Alt+反引号列表、hold 模式、剪贴板恢复、管理员权限窗口、多显示器 DPI、Win7、中文输入法下插入。
 - **Windows 本机构建已跑通**（2026-11-06）：rustup stable 1.99.1 MSVC + VS Build Tools 18 + SDK 10.0.26100；
-  `cargo test -p vibekey-core` 46 unit + 17 integration 全绿，`cargo build -p vibekey` 约 10 秒出 debug exe。
+  `cargo test -p vibekey-core` 49 unit + 18 integration 全绿，`cargo build -p vibekey` 约 10 秒出 debug exe。
 - **在 Windows 上第一件事**：
   1. 用 stable MSVC 构建 debug 版（仅 Win10/11 跑）；
   2. 按 docs/testing.md 的 P0 清单逐项验证；
@@ -166,7 +166,7 @@ Win7 目标（x86_64-win7-windows-msvc / i686-win7-windows-msvc）是 tier-3，�
 
 ### 4.1 自动测试
 
-    cargo test -p vibekey-core        # 46 unit + 17 integration（WebDAV 用 127.0.0.1 进程内 mock）
+    cargo test -p vibekey-core        # 49 unit + 18 integration（WebDAV/TLS 用 127.0.0.1 进程内 mock）
     cargo fmt --all -- --check
     cargo build -p vibekey            # Win10+ 本机
 
@@ -245,7 +245,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 - 32/64 位都要能编译：SetWindowLongPtrW/SetWindowLongW 分支；NOTIFYICONDATAW 在 x86 是 packed(1)，
   写字符串字段必须 addr_of_mut! + write_unaligned。
 - 不要改配置格式而不更新 assets/config.example.toml、docs/config.md、README。
-- 不要记录明文密码；不要放宽 TLS 校验；DPAPI 登录密文只在 secret.bin，配置加密 current/previous 只在 sync-encryption.bin。
+- 不要记录明文密码；不得全局关闭 TLS 校验。自签名仅允许 sync.certificate_sha256 指定 DER 指纹固定，并继续验证握手签名；DPAPI 登录密文只在 secret.bin，配置加密 current/previous 只在 sync-encryption.bin。
 - 加密同步的 hash 必须基于解密后明文；每个 PUT（含冲突备份、412、迁移）都必须统一 encode。已加密远端不得在启用加密时接受明文降级；默认 false 也不得在新机器/明文基线上隐式覆盖密文。
 - 密码 previous 只有在新密文可用且 state.save 成功后才能按本轮密码对条件清理；DPAPI 读校验写必须持同一 Mutex；pending 时禁止第三次换密码，不得让旧后台任务覆盖设置页刚写入的新轮换。
 

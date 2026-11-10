@@ -138,6 +138,7 @@ alt+grave    # 反引号的别名
 | `sync_on_change` | 布尔 | `true` | 保存配置后立即同步一次。 |
 | `backup_on_conflict` | 布尔 | `true` | 两端都修改时，先把远端版本备份为 `<url>.remote-backup-<时间戳>.toml`，再用本地版本覆盖远端；启用加密后备份也为密文。 |
 | `encrypt` | 布尔 | `false` | 上传前用独立同步密码进行 AES-256-GCM 加密与完整性认证；密钥由 PBKDF2-HMAC-SHA256（600,000 次）派生。旧配置缺字段时保持明文模式。 |
+| `certificate_sha256` | 字符串 | `""` | 可选的指定自签名证书 SHA-256 指纹（64 位十六进制，支持冒号/空格及 `SHA256:` 前缀）。留空保持正常 CA 与主机名校验；不是“接受所有证书”。 |
 | `timeout_secs` | 整数 | `20` | 网络连接/读/写超时（秒），必须大于 0。 |
 
 **两类密码都不在这个文件里。** WebDAV 登录密码和独立配置加密密码分别在设置窗口输入，Windows 上由 DPAPI 保存到
@@ -148,6 +149,7 @@ alt+grave    # 反引号的别名
 - 本地 `config.toml` 与 `config.toml.bak` 始终是可编辑的明文；加密只保护 WebDAV 主文件和远端冲突备份。
 - HTTP 下配置正文不直接暴露，但 Basic 登录凭据、URL 和元数据仍不受此功能保护，正式使用仍需 HTTPS。
 - 日志不会记录两类明文密码；忘记配置加密密码无法从密文恢复。
+- `certificate_sha256` 是公开证书指纹而非秘密，可随配置同步。它仅用于明确信任一张自签名证书；其他服务器仍按默认规则验证，证书更换后需更新指纹。
 
 同步的冲突策略、各服务商 URL 示例见 [webdav.md](webdav.md)。
 
@@ -225,6 +227,7 @@ interval_minutes = 15
 sync_on_change = true
 backup_on_conflict = true
 encrypt = true
+certificate_sha256 = ""
 timeout_secs = 20
 
 [[snippet]]
