@@ -19,7 +19,7 @@ Vibekey 是一个常驻托盘的小工具：按住 Alt 后按数字键，就能�
 ## 目录结构
 
     Cargo.toml                  workspace
-    crates/vibekey-core/        平台无关：配置 / 快捷键 / 展开 / 同步 / 状态
+    crates/vibekey-core/        平台无关：配置 / 快捷键 / 展开 / 加密 / 同步 / 状态
     crates/vibekey-win/         Win32 前端：钩子 / 输入 / 托盘 / 菜单 / 弹窗 / 设置
     scripts/                    交叉编译工具链与构建脚本
     docs/                       设计、Win7 说明、WebDAV 说明
@@ -96,18 +96,26 @@ CloseClipboard 前、仍独占剪贴板时返回本次 GetClipboardSequenceNumbe
 
 ### 5. 密码与同步
 
-WebDAV 密码不写入 config.toml：Windows 上用 DPAPI 加密后存放在 %APPDATA%\Vibekey\secret.bin，
-这样同步出去的配置文件不含秘密，换机器时需要重新输入一次密码。
+WebDAV 登录密码和独立配置加密密码都不写入 config.toml：Windows 上分别用 DPAPI 存放在
+%APPDATA%\Vibekey\secret.bin 与 sync-encryption.bin，换机器时需要重新输入。
+可选 sync.encrypt 使用 PBKDF2-HMAC-SHA256（600k）+ AES-256-GCM；随机 salt/nonce、头部 AAD、版本信封和认证失败关闭。
+本地 TOML 始终明文，远端主文件与冲突备份共用唯一 encode 出口。
 
 同步逻辑在 vibekey-core::sync::engine，HTTP 客户端可替换（测试用内存实现）：
 
-- 本地 hash、远端 hash 都记录在 sync-state.json，用内容 hash 判断“谁变了”，不依赖服务器是否返回 ETag。
-- 只有本地变 → 用 If-Match 上传；远端变 → 下载并备份旧本地文件。
-- 两边都变 → 远端先备份成 <url>.remote-backup-时间戳.toml，然后本地覆盖远端（本地优先）。
-- 首次同步（无状态）且远端已有文件 → 以远端为准（新机器接管已有配置）。
-- 远端文件解析失败时拒绝覆盖本地。
+- GET 先识别/解密/认证远端，再以明文内容 hash 判断“谁变了”；随机密文绝不参与 changed/hash 比较。
+- sync-state.json 同时记录 remote_encrypted；已加密远端在加密模式下变成明文会拒绝 HTTP downgrade。
+  反向也受控：只有本机已有 encrypted=true 基线才允许主动关闭并迁移明文；新机器/明文基线的默认 false 不得覆盖别人的密文。
+- 格式迁移、密码轮换与真实内容编辑正交；拉取保留本次本地 encrypt 策略，纯策略切换不产生假冲突。
+- 只有本地变 → 用 If-Match 加密上传；远端变 → 解密、必要时安全重传，再下载并备份旧本地文件。
+- 两边都变 → 远端先重新加密备份成 <url>.remote-backup-时间戳.toml，然后本地覆盖远端（本地优先）。
+- 首次同步（无状态）且远端已有文件 → 以远端为准（新机器接管已有配置）；旧明文可显式迁移为密文。
+- 错密码、篡改、未知版本、远端解析失败均拒绝覆盖本地，也不进行 local-wins 强盖。
+- 密码轮换在一个 DPAPI blob 中保存 current/previous；上传只用 current，状态保存成功后按本轮密码对条件删除 previous，
+  避免后台同步与设置页并发修改时误删新轮换。关闭加密需保留密码完成显式解密迁移。
 
 HTTP：ureq + rustls + 内置 webpki 根证书（不依赖系统证书库，规避 Win7 根证书过期问题），Basic 认证。
+内容加密不保护 Basic 请求头、URL/元数据，不防合法旧密文回滚，因此仍需 HTTPS。
 
 ### 6. Win7 构建
 
@@ -140,6 +148,7 @@ Rust 1.78 起，普通 *-pc-windows-* 目标的 std 要求 Windows 10；官方�
     interval_minutes = 15
     sync_on_change = true
     backup_on_conflict = true
+    encrypt = true
     timeout_secs = 20
 
     [[snippet]]

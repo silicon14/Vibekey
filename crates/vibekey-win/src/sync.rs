@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vibekey_core::sync::{SyncEngine, SyncOutcome, UreqWebDav};
-use vibekey_core::{Config, SecretStore, SyncState};
+use vibekey_core::sync::{SyncEngine, SyncError, SyncOutcome, SyncProtection, UreqWebDav};
+use vibekey_core::{Config, CryptoError, SecretKind, SecretStore, SyncState};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::util::{isize_to_hwnd, WM_APP_RELOAD, WM_APP_SYNC_DONE};
@@ -26,6 +26,7 @@ pub struct SyncSettings {
     pub username: String,
     pub interval_minutes: u32,
     pub backup_on_conflict: bool,
+    pub encrypt: bool,
     pub timeout_secs: u64,
     pub config_path: PathBuf,
 }
@@ -38,6 +39,7 @@ impl SyncSettings {
             username: config.sync.username.clone(),
             interval_minutes: config.sync.interval_minutes,
             backup_on_conflict: config.sync.backup_on_conflict,
+            encrypt: config.sync.encrypt,
             timeout_secs: config.sync.timeout_secs,
             config_path,
         }
@@ -271,8 +273,9 @@ fn run_sync(
         }
         return;
     }
-    let password = match secrets.load_password() {
+    let password = match secrets.load(SecretKind::WebDav) {
         Ok(Some(password)) => password,
+        Ok(None) if settings.username.is_empty() => String::new(),
         Ok(None) => {
             finish(
                 shared,
@@ -292,7 +295,55 @@ fn run_sync(
                     manual,
                     ok: false,
                     pulled: false,
-                    message: format!("无法读取已保存的密码：{error}"),
+                    message: format!("无法读取已保存的 WebDAV 密码：{error}"),
+                },
+            );
+            return;
+        }
+    };
+    // Capture one coherent password pair for this entire run. Conditional
+    // rotation commit below prevents an older run from clearing a newer pair.
+    let (encryption_current, encryption_previous) = match secrets.load_encryption_passwords() {
+        Ok(pair) => pair,
+        Err(error) => {
+            finish(
+                shared,
+                SyncResult {
+                    manual,
+                    ok: false,
+                    pulled: false,
+                    message: format!("无法读取配置加密密码及轮换状态：{error}"),
+                },
+            );
+            return;
+        }
+    };
+    if settings.encrypt && encryption_current.is_none() {
+        finish(
+            shared,
+            SyncResult {
+                manual,
+                ok: false,
+                pulled: false,
+                message: "已启用配置加密，请在设置中填写独立同步密码".to_string(),
+            },
+        );
+        return;
+    }
+    let protection = match SyncProtection::new(
+        settings.encrypt,
+        encryption_current.clone(),
+        encryption_previous.clone(),
+    ) {
+        Ok(protection) => protection,
+        Err(error) => {
+            finish(
+                shared,
+                SyncResult {
+                    manual,
+                    ok: false,
+                    pulled: false,
+                    message: sync_error_message(&SyncError::Crypto(error)),
                 },
             );
             return;
@@ -306,7 +357,8 @@ fn run_sync(
         settings.url.clone(),
         settings.config_path.clone(),
         settings.backup_on_conflict,
-    );
+    )
+    .with_protection(protection);
     let state_path = SyncState::path_for(&settings.config_path);
     let mut state = SyncState::load(&state_path);
     let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -314,7 +366,30 @@ fn run_sync(
     match engine.sync(&mut state, &timestamp) {
         Ok(outcome) => {
             if let Err(error) = state.save(&state_path) {
+                let message =
+                    format!("同步内容已处理，但状态保存失败：{error}。请重试；旧加密密码已保留");
                 log::warn!("could not save the sync state: {error}");
+                finish(
+                    shared,
+                    SyncResult {
+                        manual,
+                        ok: false,
+                        pulled: false,
+                        message,
+                    },
+                );
+                return;
+            }
+            if let Some(current) = encryption_current.as_deref() {
+                if let Err(error) = secrets.finish_password_rotation(
+                    SecretKind::ConfigEncryption,
+                    current,
+                    encryption_previous.as_deref(),
+                ) {
+                    // The new remote is already usable. Retaining the previous
+                    // password is safe and the next successful sync retries it.
+                    log::warn!("could not finish encryption password rotation: {error}");
+                }
             }
             let (pulled, message) = match outcome {
                 SyncOutcome::UpToDate => (false, "配置已是最新".to_string()),
@@ -350,8 +425,8 @@ fn run_sync(
             );
         }
         Err(error) => {
-            let message = format!("同步失败：{error}");
-            log::warn!("{message}");
+            let message = sync_error_message(&error);
+            log::warn!("sync failed: {error}");
             state.record_error(error.to_string());
             if let Err(error) = state.save(&state_path) {
                 log::warn!("could not save the sync state: {error}");
@@ -366,6 +441,35 @@ fn run_sync(
                 },
             );
         }
+    }
+}
+
+fn sync_error_message(error: &SyncError) -> String {
+    match error {
+        SyncError::Crypto(CryptoError::PasswordRequired) => {
+            "同步失败：启用配置加密后必须设置独立同步密码".to_string()
+        }
+        SyncError::Crypto(CryptoError::PasswordTooShort) => {
+            "同步失败：配置加密密码至少需要 8 个字符".to_string()
+        }
+        SyncError::Crypto(CryptoError::Decrypt) => {
+            "同步失败：配置加密密码错误，或远端加密内容已被篡改；本地配置未修改".to_string()
+        }
+        SyncError::Crypto(CryptoError::InvalidFormat) => {
+            "同步失败：远端加密配置格式无效或版本不受支持；本地配置未修改".to_string()
+        }
+        SyncError::Crypto(CryptoError::Random | CryptoError::Encrypt) => {
+            "同步失败：系统无法安全加密配置，请重试".to_string()
+        }
+        SyncError::EncryptionRequired => {
+            "同步失败：远端已加密，请先在本机启用配置加密并成功同步。只有主动关闭已确认的加密状态才能迁移为明文"
+                .to_string()
+        }
+        SyncError::Downgrade => {
+            "同步失败：远端此前已加密，现在却被替换为明文。已阻止 HTTP 降级，未覆盖任何配置"
+                .to_string()
+        }
+        _ => format!("同步失败：{error}"),
     }
 }
 

@@ -11,7 +11,8 @@ pub mod run;
 pub mod webdav;
 
 pub use engine::{
-    content_hash, PutResult, RemoteConfig, SyncEngine, SyncError, SyncOutcome, WebDav,
+    content_hash, PutResult, RemoteConfig, SyncEngine, SyncError, SyncOutcome, SyncProtection,
+    WebDav,
 };
-pub use run::{last_state, sync_once};
+pub use run::{last_state, sync_once, sync_once_protected};
 pub use webdav::{parent_url, UreqWebDav};

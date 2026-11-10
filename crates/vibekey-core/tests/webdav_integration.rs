@@ -26,8 +26,11 @@ use base64::Engine as _;
 use tempfile::TempDir;
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
-use vibekey_core::sync::{last_state, sync_once, SyncError, SyncOutcome};
-use vibekey_core::{Config, SyncConfig};
+use vibekey_core::crypto::{decrypt_config, encrypt_config, is_encrypted_config};
+use vibekey_core::sync::{
+    last_state, sync_once, sync_once_protected, SyncError, SyncOutcome, SyncProtection,
+};
+use vibekey_core::{Config, CryptoError, SyncConfig};
 
 /// Timestamp passed to sync_once; also part of the remote backup file name.
 const TS: &str = "2026-11-06-11-00-00";
@@ -49,6 +52,8 @@ struct MockState {
     etag_counter: u32,
     /// None disables authentication (the client may send any header).
     credentials: Option<(String, String)>,
+    /// Fail exactly one PUT after the request reached the server.
+    reject_next_put: bool,
     /// "METHOD /path" of every request, in order.
     requests: Vec<String>,
 }
@@ -70,6 +75,7 @@ impl MockDav {
             etag_counter: 0,
             credentials: credentials
                 .map(|(user, password)| (user.to_string(), password.to_string())),
+            reject_next_put: false,
             requests: Vec::new(),
         }));
 
@@ -124,6 +130,27 @@ impl MockDav {
 
     fn requests(&self) -> Vec<String> {
         self.state.lock().unwrap().requests.clone()
+    }
+
+    fn put_count(&self, path: &str) -> usize {
+        let expected = format!("PUT {path}");
+        self.requests()
+            .iter()
+            .filter(|request| *request == &expected)
+            .count()
+    }
+
+    fn reject_next_put(&self) {
+        self.state.lock().unwrap().reject_next_put = true;
+    }
+
+    /// Simulate a raw external writer, including tampering/downgrade attacks.
+    fn store(&self, path: &str, body: Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        let etag = next_etag(&mut state);
+        state
+            .files
+            .insert(path.to_string(), StoredFile { body, etag });
     }
 
     /// Simulate another writer that updated the file's metadata but not its
@@ -193,6 +220,9 @@ fn handle_request(mut request: Request, state: &Mutex<MockState>) -> std::io::Re
             request.as_reader().read_to_end(&mut body)?;
             if !state.collections.contains(parent_path(&path)) {
                 return request.respond(empty_response(409));
+            }
+            if std::mem::take(&mut state.reject_next_put) {
+                return request.respond(empty_response(412));
             }
             let etag_matches = match if_match.as_deref() {
                 None => true,
@@ -319,6 +349,7 @@ fn sync_config(dav: &MockDav, remote_path: &str) -> SyncConfig {
         interval_minutes: 0,
         sync_on_change: true,
         backup_on_conflict: true,
+        encrypt: false,
         timeout_secs: 5,
     }
 }
@@ -686,4 +717,416 @@ fn large_chinese_body_round_trips_byte_for_byte() {
     assert_eq!(outcome, SyncOutcome::Pulled);
     assert_eq!(target.load().snippet[0].text, payload);
     assert_eq!(target.read_bytes(), remote);
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated configuration encryption over intentionally plaintext HTTP
+// ---------------------------------------------------------------------------
+
+const SYNC_PASSWORD: &str = "a separate configuration password";
+
+fn encryption(current: &str) -> SyncProtection {
+    SyncProtection::new(true, Some(current.to_string()), None).expect("valid encryption settings")
+}
+
+fn encrypted_sync(dav: &MockDav) -> SyncConfig {
+    SyncConfig {
+        encrypt: true,
+        ..sync_config(dav, REMOTE_PATH)
+    }
+}
+
+#[test]
+fn encrypted_http_round_trip_hides_secrets_and_second_sync_is_a_noop() {
+    let dav = MockDav::start(None);
+    let source = Machine::new();
+    let mut config = Config::example();
+    config.sync.encrypt = true;
+    config.snippet[0].text = "绝密片段-不得出现在HTTP正文中".to_string();
+    source.save(&config);
+    let sync = encrypted_sync(&dav);
+
+    let (outcome, state) =
+        sync_once_protected(source.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+            .expect("encrypted first upload");
+    assert_eq!(outcome, SyncOutcome::Pushed { first_upload: true });
+    assert_eq!(state.remote_encrypted, Some(true));
+    assert_eq!(state.local_hash, state.remote_hash);
+
+    let remote = dav.body(REMOTE_PATH).expect("encrypted remote");
+    assert!(is_encrypted_config(&remote));
+    assert!(!remote
+        .windows("绝密片段".len())
+        .any(|window| window == "绝密片段".as_bytes()));
+    assert_ne!(remote, source.read_bytes());
+
+    let (outcome, _) =
+        sync_once_protected(source.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+            .expect("encrypted no-op");
+    assert_eq!(outcome, SyncOutcome::UpToDate);
+    assert_eq!(dav.put_count(REMOTE_PATH), 1, "no-op must not re-encrypt");
+
+    let target = Machine::new();
+    let mut target_config = target.load();
+    target_config.sync.encrypt = true;
+    target.save(&target_config);
+    let (outcome, _) =
+        sync_once_protected(target.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+            .expect("new machine decrypts");
+    assert_eq!(outcome, SyncOutcome::Pulled);
+    assert_eq!(
+        target.load().snippet[0].text,
+        "绝密片段-不得出现在HTTP正文中"
+    );
+    assert!(
+        target.load().sync.encrypt,
+        "pull must preserve local policy"
+    );
+    assert_ne!(target.read_bytes(), remote, "local TOML remains plaintext");
+    assert!(target.dir().join("config.toml.bak").exists());
+}
+
+#[test]
+fn wrong_password_tamper_and_plaintext_downgrade_fail_closed() {
+    let dav = MockDav::start(None);
+    let machine = Machine::new();
+    let mut config = machine.load();
+    config.sync.encrypt = true;
+    config.snippet[0].text = "authenticated secret".to_string();
+    machine.save(&config);
+    let sync = encrypted_sync(&dav);
+    sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+        .expect("initial encrypted upload");
+    let local_before = machine.read_bytes();
+    let remote_before = dav.body(REMOTE_PATH).unwrap();
+
+    let error = sync_once_protected(
+        machine.path(),
+        &sync,
+        None,
+        encryption("definitely wrong password"),
+        TS,
+    )
+    .expect_err("wrong encryption password must fail");
+    assert!(matches!(error, SyncError::Crypto(CryptoError::Decrypt)));
+    assert_eq!(machine.read_bytes(), local_before);
+    assert_eq!(dav.body(REMOTE_PATH).unwrap(), remote_before);
+    assert_eq!(dav.put_count(REMOTE_PATH), 1);
+
+    let mut tampered = remote_before.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    dav.store(REMOTE_PATH, tampered);
+    let error = sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+        .expect_err("tampering must fail authentication");
+    assert!(matches!(error, SyncError::Crypto(CryptoError::Decrypt)));
+    assert_eq!(machine.read_bytes(), local_before);
+    assert_eq!(dav.put_count(REMOTE_PATH), 1);
+
+    dav.store(
+        REMOTE_PATH,
+        Config::example().to_toml().unwrap().into_bytes(),
+    );
+    let error = sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+        .expect_err("encrypted-to-plaintext downgrade must fail");
+    assert!(matches!(error, SyncError::Downgrade));
+    assert_eq!(machine.read_bytes(), local_before);
+    assert_eq!(dav.put_count(REMOTE_PATH), 1);
+    assert!(dav.keys().iter().all(|key| !key.contains("remote-backup")));
+
+    let invalid_secret = "text = \"decrypted-secret-that-must-not-enter-logs";
+    dav.store(
+        REMOTE_PATH,
+        encrypt_config(invalid_secret.as_bytes(), SYNC_PASSWORD).unwrap(),
+    );
+    let error = sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+        .expect_err("invalid decrypted TOML must fail without leaking its source line");
+    match error {
+        SyncError::RemoteInvalid(message) => {
+            assert!(!message.contains("decrypted-secret"), "leaked: {message}");
+        }
+        other => panic!("expected RemoteInvalid, got {other:?}"),
+    }
+    let recorded = last_state(machine.path()).last_error.unwrap();
+    assert!(
+        !recorded.contains("decrypted-secret"),
+        "state leaked: {recorded}"
+    );
+    assert_eq!(machine.read_bytes(), local_before);
+    assert_eq!(dav.put_count(REMOTE_PATH), 1);
+}
+
+#[test]
+fn plaintext_conflict_and_remote_backup_are_migrated_to_ciphertext() {
+    let dav = MockDav::start(None);
+    let machine = Machine::new();
+    let sync = sync_config(&dav, REMOTE_PATH);
+    sync_once(machine.path(), &sync, None, TS).expect("legacy plaintext sync");
+
+    let mut local = machine.load();
+    local.sync.encrypt = true;
+    local.snippet[0].text = "local encrypted winner".to_string();
+    machine.save(&local);
+    let mut remote = Config::example();
+    remote.snippet[0].text = "remote secret needing encrypted backup".to_string();
+    dav.store(REMOTE_PATH, remote.to_toml().unwrap().into_bytes());
+
+    let protected_sync = encrypted_sync(&dav);
+    let (outcome, state) = sync_once_protected(
+        machine.path(),
+        &protected_sync,
+        None,
+        encryption(SYNC_PASSWORD),
+        TS,
+    )
+    .expect("encrypted conflict resolution");
+    let backup_url = match outcome {
+        SyncOutcome::ConflictLocalWins { remote_backup } => remote_backup.unwrap(),
+        other => panic!("expected conflict, got {other:?}"),
+    };
+    assert_eq!(state.remote_encrypted, Some(true));
+    let main_body = dav.body(REMOTE_PATH).unwrap();
+    assert!(is_encrypted_config(&main_body));
+    assert_eq!(
+        decrypt_config(&main_body, SYNC_PASSWORD).unwrap(),
+        machine.read_bytes()
+    );
+
+    let backup_path = backup_url
+        .strip_prefix(&format!("http://{}", dav.addr))
+        .unwrap();
+    let backup_body = dav.body(backup_path).unwrap();
+    assert!(is_encrypted_config(&backup_body));
+    assert!(!String::from_utf8_lossy(&backup_body).contains("remote secret"));
+    let backup_plain = decrypt_config(&backup_body, SYNC_PASSWORD).unwrap();
+    let backup_config = Config::parse(std::str::from_utf8(&backup_plain).unwrap()).unwrap();
+    assert_eq!(
+        backup_config.snippet[0].text,
+        "remote secret needing encrypted backup"
+    );
+    assert!(backup_config.sync.encrypt);
+}
+
+#[test]
+fn password_rotation_reencrypts_without_conflict_then_uses_only_new_password() {
+    let dav = MockDav::start(None);
+    let machine = Machine::new();
+    let mut config = machine.load();
+    config.sync.encrypt = true;
+    machine.save(&config);
+    let sync = encrypted_sync(&dav);
+    sync_once_protected(
+        machine.path(),
+        &sync,
+        None,
+        encryption("old encryption password"),
+        TS,
+    )
+    .expect("old password upload");
+    let old_remote = dav.body(REMOTE_PATH).unwrap();
+
+    let rotated = SyncProtection::new(
+        true,
+        Some("new encryption password".to_string()),
+        Some("old encryption password".to_string()),
+    )
+    .unwrap();
+    let (outcome, state) = sync_once_protected(machine.path(), &sync, None, rotated, TS)
+        .expect("rotation must re-encrypt, not conflict");
+    assert_eq!(
+        outcome,
+        SyncOutcome::Pushed {
+            first_upload: false
+        }
+    );
+    assert_eq!(state.remote_encrypted, Some(true));
+    let new_remote = dav.body(REMOTE_PATH).unwrap();
+    assert_ne!(new_remote, old_remote);
+    assert_eq!(
+        decrypt_config(&new_remote, "new encryption password").unwrap(),
+        machine.read_bytes()
+    );
+    assert_eq!(
+        decrypt_config(&new_remote, "old encryption password").unwrap_err(),
+        CryptoError::Decrypt
+    );
+
+    let (outcome, _) = sync_once_protected(
+        machine.path(),
+        &sync,
+        None,
+        encryption("new encryption password"),
+        TS,
+    )
+    .expect("new password no-op");
+    assert_eq!(outcome, SyncOutcome::UpToDate);
+    assert_eq!(dav.put_count(REMOTE_PATH), 2);
+}
+
+#[test]
+fn legacy_plaintext_is_migrated_even_when_snippets_are_identical() {
+    let dav = MockDav::start(None);
+    let machine = Machine::new();
+    let legacy = machine.read_bytes();
+    dav.store(REMOTE_PATH, legacy);
+
+    let mut local = machine.load();
+    local.sync.encrypt = true;
+    machine.save(&local);
+    let sync = encrypted_sync(&dav);
+    let (outcome, _) =
+        sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+            .expect("legacy migration");
+    assert_eq!(outcome, SyncOutcome::Pulled);
+    assert!(machine.load().sync.encrypt);
+    let remote = dav.body(REMOTE_PATH).unwrap();
+    assert!(is_encrypted_config(&remote));
+    assert_eq!(
+        decrypt_config(&remote, SYNC_PASSWORD).unwrap(),
+        machine.read_bytes()
+    );
+
+    let (outcome, _) =
+        sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+            .expect("post-migration no-op");
+    assert_eq!(outcome, SyncOutcome::UpToDate);
+    assert_eq!(dav.put_count(REMOTE_PATH), 1);
+}
+
+#[test]
+fn disabling_encryption_requires_password_and_uploads_plaintext_deliberately() {
+    let dav = MockDav::start(None);
+    let machine = Machine::new();
+    let mut config = machine.load();
+    config.sync.encrypt = true;
+    machine.save(&config);
+    let encrypted = encrypted_sync(&dav);
+    sync_once_protected(
+        machine.path(),
+        &encrypted,
+        None,
+        encryption(SYNC_PASSWORD),
+        TS,
+    )
+    .expect("encrypted upload");
+
+    let plain_sync = sync_config(&dav, REMOTE_PATH);
+    let error = sync_once_protected(
+        machine.path(),
+        &plain_sync,
+        None,
+        SyncProtection::disabled(),
+        TS,
+    )
+    .expect_err("ordinary disabled mode must not strip encryption");
+    assert!(matches!(
+        error,
+        SyncError::Crypto(CryptoError::PasswordRequired)
+    ));
+    assert!(is_encrypted_config(&dav.body(REMOTE_PATH).unwrap()));
+
+    config.sync.encrypt = false;
+    machine.save(&config);
+    let disabling = SyncProtection::new(false, Some(SYNC_PASSWORD.to_string()), None).unwrap();
+    let (outcome, state) = sync_once_protected(machine.path(), &plain_sync, None, disabling, TS)
+        .expect("explicit disable with password");
+    assert_eq!(
+        outcome,
+        SyncOutcome::Pushed {
+            first_upload: false
+        }
+    );
+    assert_eq!(state.remote_encrypted, Some(false));
+    assert_eq!(dav.body(REMOTE_PATH).unwrap(), machine.read_bytes());
+}
+
+#[test]
+fn encrypted_remote_requires_a_local_encrypted_baseline_before_disabling() {
+    let dav = MockDav::start(None);
+    let legacy = Machine::new();
+    let plain_sync = sync_config(&dav, REMOTE_PATH);
+    sync_once(legacy.path(), &plain_sync, None, TS).expect("legacy plaintext baseline");
+    let legacy_before = legacy.read_bytes();
+
+    let source = Machine::new();
+    let mut source_config = source.load();
+    source_config.sync.encrypt = true;
+    source.save(&source_config);
+    sync_once_protected(
+        source.path(),
+        &encrypted_sync(&dav),
+        None,
+        encryption(SYNC_PASSWORD),
+        TS,
+    )
+    .expect("encrypt the legacy remote");
+    let encrypted_remote = dav.body(REMOTE_PATH).unwrap();
+    assert!(is_encrypted_config(&encrypted_remote));
+    // One legacy plaintext PUT plus one encrypted migration PUT.
+    assert_eq!(dav.put_count(REMOTE_PATH), 2);
+    let puts_after_encryption = dav.put_count(REMOTE_PATH);
+
+    // A brand-new default-off machine has not deliberately disabled anything.
+    let new_machine = Machine::new();
+    let new_before = new_machine.read_bytes();
+    let with_password = SyncProtection::new(false, Some(SYNC_PASSWORD.to_string()), None).unwrap();
+    let error = sync_once_protected(new_machine.path(), &plain_sync, None, with_password, TS)
+        .expect_err("default-off must not downgrade a new encrypted remote");
+    assert!(matches!(error, SyncError::EncryptionRequired));
+    assert_eq!(new_machine.read_bytes(), new_before);
+    assert_eq!(dav.body(REMOTE_PATH).unwrap(), encrypted_remote);
+
+    // A machine whose baseline was plaintext must not silently undo another
+    // client's encryption during an ordinary periodic sync either.
+    let with_password = SyncProtection::new(false, Some(SYNC_PASSWORD.to_string()), None).unwrap();
+    let error = sync_once_protected(legacy.path(), &plain_sync, None, with_password, TS)
+        .expect_err("plaintext baseline must not authorise downgrade");
+    assert!(matches!(error, SyncError::EncryptionRequired));
+    assert_eq!(legacy.read_bytes(), legacy_before);
+    assert_eq!(dav.body(REMOTE_PATH).unwrap(), encrypted_remote);
+    assert_eq!(dav.put_count(REMOTE_PATH), puts_after_encryption);
+    assert!(dav.keys().iter().all(|key| !key.contains("remote-backup")));
+}
+
+#[test]
+fn encrypted_etag_retry_decodes_fresh_remote_and_random_reencryption_is_a_noop() {
+    let dav = MockDav::start(None);
+    let machine = Machine::new();
+    let mut config = machine.load();
+    config.sync.encrypt = true;
+    machine.save(&config);
+    let sync = encrypted_sync(&dav);
+    sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+        .expect("initial encrypted upload");
+
+    config.snippet[0].text = "encrypted local edit after stale ETag".to_string();
+    machine.save(&config);
+    dav.reject_next_put();
+    let (outcome, _) =
+        sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+            .expect("412 fresh encrypted GET then retry");
+    assert_eq!(
+        outcome,
+        SyncOutcome::Pushed {
+            first_upload: false
+        }
+    );
+    // Initial PUT + failed conditional PUT + successful retry.
+    assert_eq!(dav.put_count(REMOTE_PATH), 3);
+    assert_eq!(
+        decrypt_config(&dav.body(REMOTE_PATH).unwrap(), SYNC_PASSWORD).unwrap(),
+        machine.read_bytes()
+    );
+    assert!(dav.keys().iter().all(|key| !key.contains("remote-backup")));
+
+    // Another client may re-encrypt identical plaintext with a fresh salt and
+    // nonce. Ciphertext bytes and ETag change, but logical content does not.
+    let reencrypted = encrypt_config(&machine.read_bytes(), SYNC_PASSWORD).unwrap();
+    dav.store(REMOTE_PATH, reencrypted);
+    let (outcome, state) =
+        sync_once_protected(machine.path(), &sync, None, encryption(SYNC_PASSWORD), TS)
+            .expect("same plaintext under a new envelope is up to date");
+    assert_eq!(outcome, SyncOutcome::UpToDate);
+    assert_eq!(state.remote_encrypted, Some(true));
+    assert_eq!(dav.put_count(REMOTE_PATH), 3);
 }

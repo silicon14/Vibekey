@@ -9,13 +9,13 @@
 
 - **项目是什么**：Vibekey 是一个常驻托盘的 Windows 小工具。按住 Alt 后按数字键，把预设文字直接输入当前窗口；
   Alt+反引号打开单行片段列表，Alt+V 打开内存文本剪贴板历史，Alt+Backspace 打开配置菜单；配置是纯文本 TOML；支持 WebDAV 同步。
-- **当前状态**：功能已完整实现，源码在仓库里；core 有 38 个单元测试 + 9 个 WebDAV 集成测试全绿；
+- **当前状态**：功能已完整实现，源码在仓库里；core 有 46 个单元测试 + 17 个 WebDAV 集成测试全绿；
   Win7 x64/i686 的 exe 已用 Linux 交叉编译产出，PE 头/导入表已做静态校验。
 - **真机验证进度**（2026-11-06，Windows 11 26200 x64）：已确认启动 / 托盘图标 / 右键菜单 /
   双击设置窗口 / 单实例 / 退出 / 真键盘 Alt+1 插入全部正常，记录见 `docs/testing-win11-2026-11-06.md`。
   仍待验证：Alt+反引号列表、hold 模式、剪贴板恢复、管理员权限窗口、多显示器 DPI、Win7、中文输入法下插入。
 - **Windows 本机构建已跑通**（2026-11-06）：rustup stable 1.99.1 MSVC + VS Build Tools 18 + SDK 10.0.26100；
-  `cargo test -p vibekey-core` 38 unit + 9 integration 全绿，`cargo build -p vibekey` 约 10 秒出 debug exe。
+  `cargo test -p vibekey-core` 46 unit + 17 integration 全绿，`cargo build -p vibekey` 约 10 秒出 debug exe。
 - **在 Windows 上第一件事**：
   1. 用 stable MSVC 构建 debug 版（仅 Win10/11 跑）；
   2. 按 docs/testing.md 的 P0 清单逐项验证；
@@ -52,12 +52,13 @@
 - Alt+Backspace 或右键托盘：配置菜单（列表、历史、新建片段、设置、TOML、重载、同步、启动、日志、关于、退出）
 - 统一设置中心：图形化片段库（搜索/新建/复制/删除/快速编辑）、全部输入行为与全局热键、WebDAV 同步与备份
 - 模板变量：{date}、{time}、{datetime}、{clipboard}、{user}、{host}
-- WebDAV 同步：内容哈希判冲突，本地优先 + 远端备份；密码用 DPAPI 加密保存，不随配置同步
+- WebDAV 同步：明文内容哈希判冲突，本地优先 + 远端备份；可选 PBKDF2 + AES-256-GCM 内容加密与防降级；
+  WebDAV 登录密码和独立配置加密密码分别用 DPAPI 保存，不随配置同步
 - 单实例、托盘气泡、日志轮转、配置热重载、配置原子写
 
 ### 目录
 
-    crates/vibekey-core/       平台无关：config / keymap / expand / sync / secret / state
+    crates/vibekey-core/       平台无关：config / keymap / expand / crypto / sync / secret / state
     crates/vibekey-win/        Win32 前端：app / history / hook / inject / sync / secret / autostart / log / util + ui/{tray,menu,popup,settings,theme}
     docs/                      设计、Win7 构建、配置、WebDAV、测试清单
     scripts/                   Linux 交叉编译/打包/校验脚本（bash）
@@ -164,7 +165,7 @@ Win7 目标（x86_64-win7-windows-msvc / i686-win7-windows-msvc）是 tier-3，�
 
 ### 4.1 自动测试
 
-    cargo test -p vibekey-core        # 38 unit + 9 integration（WebDAV 用 127.0.0.1 进程内 mock）
+    cargo test -p vibekey-core        # 46 unit + 17 integration（WebDAV 用 127.0.0.1 进程内 mock）
     cargo fmt --all -- --check
     cargo build -p vibekey            # Win10+ 本机
 
@@ -213,7 +214,8 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 | core::config | TOML 配置模型、默认值、校验、原子读写、配置目录 |
 | core::keymap | 快捷键解析（alt+1 / alt+backspace / alt+反引号）、Alt 槽位绑定、冲突检测 |
 | core::expand | 片段模板变量展开 |
-| core::sync | WebDAV 同步引擎（冲突判定/备份）+ ureq 客户端 + 状态持久化 |
+| core::crypto | 版本化配置加密信封、PBKDF2-HMAC-SHA256 600k、AES-256-GCM、认证/篡改失败关闭 |
+| core::sync | 明文哈希同步引擎、格式迁移/密码轮换/防降级 + ureq 客户端 + 状态持久化 |
 | core::secret | 平台密码存储抽象（Windows 由 win 端用 DPAPI 实现） |
 | win::app | 单实例、隐藏主窗口、消息循环、托盘/菜单/弹窗/设置调度、热重载、退出 |
 | win::hook | 独立线程的 WH_KEYBOARD_LL 全局钩子、Alt 状态、hold 计时、吞键 |
@@ -242,7 +244,9 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 - 32/64 位都要能编译：SetWindowLongPtrW/SetWindowLongW 分支；NOTIFYICONDATAW 在 x86 是 packed(1)，
   写字符串字段必须 addr_of_mut! + write_unaligned。
 - 不要改配置格式而不更新 assets/config.example.toml、docs/config.md、README。
-- 不要记录明文密码；不要放宽 TLS 校验；DPAPI 密文只在 secret.bin。
+- 不要记录明文密码；不要放宽 TLS 校验；DPAPI 登录密文只在 secret.bin，配置加密 current/previous 只在 sync-encryption.bin。
+- 加密同步的 hash 必须基于解密后明文；每个 PUT（含冲突备份、412、迁移）都必须统一 encode。已加密远端不得在启用加密时接受明文降级；默认 false 也不得在新机器/明文基线上隐式覆盖密文。
+- 密码 previous 只有在新密文可用且 state.save 成功后才能按本轮密码对条件清理；DPAPI 读校验写必须持同一 Mutex；pending 时禁止第三次换密码，不得让旧后台任务覆盖设置页刚写入的新轮换。
 
 ### 5.3 几个容易踩的坑（都已处理，改代码时别破坏）
 
@@ -283,7 +287,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 - [ ] 非文本剪贴板时改逐字输入，长文本较慢；如需更快可考虑 OLE IDataObject 完整快照（复杂，谨慎）
 - [ ] 菜单 owner 是隐藏窗口，极端前台锁场景下菜单可能需点击空白才消失（实测确认）
 - [ ] 代码签名 / SmartScreen 提示（需要证书，非代码问题）
-- [ ] WebDAV 只支持 Basic 认证；Digest/OAuth 未实现
+- [ ] WebDAV 只支持 Basic 认证；Digest/OAuth 未实现。内容加密不保护 Basic 头/元数据，不防旧密文回滚，仍需 HTTPS
 - [ ] CI 未在真实 GitHub 跑过；跑通后把 badge / artifact 用法补进 README
 
 ### P2：可选增强
@@ -299,7 +303,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 
 - 日志：%APPDATA%\Vibekey\vibekey.log，超过 1 MB 轮转；菜单 →「打开日志文件」。
 - 更详细日志：设置环境变量 VIBEKEY_LOG=debug 后重启程序。
-- 配置文件：%APPDATA%\Vibekey\config.toml；同步状态 sync-state.json；DPAPI 密码 secret.bin。
+- 配置文件：%APPDATA%\Vibekey\config.toml；同步状态 sync-state.json；DPAPI 登录密码 secret.bin；配置加密密码 sync-encryption.bin。
 - 单实例：同时只能运行一个；测试多配置时先退出，或换 Windows 用户/沙盒。
 - 钩子装不上：多半被安全软件拦截，日志会记录 SetWindowsHookExW 错误码。
 - 常见问题排查表见 README「排查问题」。

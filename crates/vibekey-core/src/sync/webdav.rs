@@ -84,7 +84,7 @@ impl WebDav for UreqWebDav {
                     .into_reader()
                     .read_to_end(&mut body)
                     .map_err(|err| SyncError::Network(err.to_string()))?;
-                Ok(Some(RemoteConfig { body, etag }))
+                Ok(Some(RemoteConfig::new(body, etag)))
             }
             Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(err) => Err(map_ureq_error(err)),
@@ -92,9 +92,12 @@ impl WebDav for UreqWebDav {
     }
 
     fn put(&self, url: &str, body: &[u8], if_match: Option<&str>) -> Result<PutResult, SyncError> {
-        let mut request = self
-            .request("PUT", url)
-            .set("Content-Type", "text/plain; charset=utf-8");
+        let content_type = if crate::crypto::has_config_envelope_marker(body) {
+            "application/octet-stream"
+        } else {
+            "text/plain; charset=utf-8"
+        };
+        let mut request = self.request("PUT", url).set("Content-Type", content_type);
         if let Some(etag) = if_match {
             request = request.set("If-Match", etag);
         }

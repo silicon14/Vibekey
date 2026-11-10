@@ -19,6 +19,10 @@ sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
 base64 = "0.22"
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+pbkdf2 = "0.12.2"
+getrandom = "0.2"
+zeroize = "=1.8.1"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

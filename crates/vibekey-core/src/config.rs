@@ -81,6 +81,9 @@ pub struct SyncConfig {
     pub sync_on_change: bool,
     /// Keep a copy of the remote file when both sides changed.
     pub backup_on_conflict: bool,
+    /// Encrypt and authenticate the configuration before uploading it. The
+    /// separate encryption password is kept in the platform secret store.
+    pub encrypt: bool,
     pub timeout_secs: u64,
 }
 
@@ -93,6 +96,7 @@ impl Default for SyncConfig {
             interval_minutes: 15,
             sync_on_change: true,
             backup_on_conflict: true,
+            encrypt: false,
             timeout_secs: 20,
         }
     }

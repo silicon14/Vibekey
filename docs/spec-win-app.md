@@ -165,8 +165,9 @@ GetGUIThreadInfo 的 rcCaret → ClientToScreen，失败回退 GetCursorPos）�
   send_enter、enabled；模板变量 combo + 插入按钮用 EM_REPLACESEL 插入到当前光标。
 - 输入与快捷键：paste/type、restore_clipboard、immediate/hold、hold_ms、start_with_windows、list/config/history
   三个全局热键、ignore_apps。所有 Config 行为字段都有图形化入口。
-- 同步与备份：enabled、URL、用户名、密码、interval_minutes、timeout_secs、sync_on_change、backup_on_conflict、
-  测试连接和“清除已保存密码”。密码继续只走 SecretStore，清除操作在应用时执行。
+- 同步与备份：enabled、URL、用户名、WebDAV 登录密码、encrypt、独立配置加密密码、interval_minutes、timeout_secs、
+  sync_on_change、backup_on_conflict、测试连接和分别清除两类密码。加密密码至少 8 个字符；测试发现加密远端时必须在后台线程
+  实际解密验证。密码只走 SecretStore，清除操作在应用时执行，留空保留。
 
 编辑先更新窗口内 Config 工作副本，取消/关闭有未保存确认，不直接写文件。应用/保存流程：
 读取其它页面控件 → 校验数值范围、WebDAV URL 和 Keymap（含重复槽位）→ 检测 external mtime 变化并确认 →
@@ -175,9 +176,12 @@ GetGUIThreadInfo 的 rcCaret → ClientToScreen，失败回退 GetCursorPos）�
 
 ### secret.rs
 
-实现 vibekey_core::SecretStore：DPAPI CryptProtectData / CryptUnprotectData（可选熵 b"Vibekey"），
-密文 base64 后写入 %APPDATA%\Vibekey\secret.bin（原子写）。读取失败返回 SecretError::Unavailable/Decrypt。
-日志里绝不能出现明文密码。
+实现 vibekey_core::SecretStore：DPAPI CryptProtectData / CryptUnprotectData。WebDAV 登录密码沿用 b"Vibekey" entropy
+和 secret.bin；配置加密密码用独立 entropy 和 sync-encryption.bin，密文 base64 后原子写。后者在单个加密 JSON blob 内保存
+current/previous：先尝试 current 解密，previous 只用于轮换，finish_password_rotation 必须比对本轮完整密码对再条件清理。
+store/clear/finish 的完整读校验写由同一 DpapiSecretStore Mutex 串行化；pending previous 存在时禁止再次换成第三个密码，
+防止 PUT 成功但状态未保存的崩溃边界丢失可用密码。
+读取失败返回 SecretError::Unavailable/Decrypt。日志里绝不能出现明文密码。
 
 ### autostart.rs
 
@@ -192,10 +196,13 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run，值名 "Vibekey"，数据�
 每次同步：
 
 - 读取当前 Config 快照（由主线程通过 ConfigChanged 更新），未启用或 URL 为空则跳过。
-- 密码从 SecretStore 读取；缺失则记录日志并气泡提示（节流），跳过。
-- UreqWebDav::new(username, password, timeout) → SyncEngine::new(dav, url, config_path, backup_on_conflict)
-  → state = SyncState::load(SyncState::path_for(config_path)) → engine.sync(&mut state, timestamp)
-  → state.save。
+- 每轮开始一次性读取 WebDAV 密码及配置加密 current/previous，组成不可变 SyncProtection；encrypt=true 缺少 current 则跳过并提示。
+  PBKDF2/加解密只在同步工作线程执行。匿名 WebDAV 用户名为空时允许登录密码为空。
+- UreqWebDav::new(username, password, timeout) → SyncEngine::new(...).with_protection(...)
+  → state = SyncState::load(...) → engine.sync。GET 先解密认证，所有 hash 都基于明文；所有 PUT（含备份/412/迁移）统一加密。
+  marked + encrypt=false 仅在本机 state.remote_encrypted=Some(true) 时允许主动关闭迁移；None/Some(false) 返回 EncryptionRequired，禁止隐式明文覆盖。
+- engine 成功后必须先 state.save；保存失败保留 previous 并报告。保存成功后才按本轮 current/previous 条件提交轮换清理，
+  防止设置页在网络等待期间写入更新密码对后被旧任务误删。
 - 时间戳用 chrono::Local::now().format("%Y%m%d-%H%M%S")。
 - Pulled → PostMessage WM_APP_RELOAD；错误 → 记录日志 + 气泡（节流），state.record_error 并保存。
 - 手动同步完成后通过主窗口气泡提示结果（成功/冲突/失败）。
@@ -210,7 +217,8 @@ VIBEKEY_LOG=debug 控制。
 
 允许使用（已实现，勿改）：Config/Config::load_or_create/save/validate/snippet_for_key/visible_snippets、
 Keymap::build/resolve/list_hotkey/config_hotkey、Binding、Hotkey/Key/Modifiers、expand/ExpandContext、
-SyncEngine/WebDav/UreqWebDav/SyncState/SyncError/SyncOutcome、SecretStore/SecretError。
+SyncEngine/WebDav/UreqWebDav/SyncState/SyncError/SyncOutcome/SyncProtection、SecretStore/SecretKind/SecretError、
+crypto::{encrypt_config, decrypt_config, validate_password}。
 
 需要新增 core API 时不要直接改 core：把需求发给 Lead（message），Lead 统一修改。
 

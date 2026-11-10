@@ -43,8 +43,9 @@ config = "alt+backspace"
 history = "alt+v"
 
 [sync]
-# 是否启用 WebDAV 同步。密码不在本文件里：保存时由 Windows DPAPI 加密到
-# %APPDATA%\Vibekey\secret.bin，不会随配置文件同步，换机器需重新输入。
+# 是否启用 WebDAV 同步。两类密码都不在本文件里：WebDAV 登录密码由 DPAPI 保存到
+# %APPDATA%\Vibekey\secret.bin，配置加密密码保存到 sync-encryption.bin；
+# 换机器需分别重新输入。
 enabled = false
 
 # 远端配置文件的完整 URL（指向文件，不是目录）。
@@ -68,6 +69,11 @@ sync_on_change = true
 # 两端都修改时，先把远端版本备份为 <url>.remote-backup-<时间戳>.toml，
 # 再用本地版本覆盖远端（本地优先，不自动合并）。
 backup_on_conflict = true
+
+# 上传前用独立同步密码加密并认证配置正文，HTTP 下也不会直接暴露片段内容。
+# 密码至少 8 个字符，在设置窗口输入，不会写入本文件；各设备必须使用该密码。
+# 注意：HTTP 仍会暴露 WebDAV Basic 登录凭据，正式使用仍建议 HTTPS。
+encrypt = true
 
 # 网络超时（秒），必须大于 0。
 timeout_secs = 20

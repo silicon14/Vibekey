@@ -14,6 +14,10 @@ pub struct SyncState {
     pub local_hash: Option<String>,
     /// SHA-256 of the remote configuration after the last sync.
     pub remote_hash: Option<String>,
+    /// Whether the last successfully verified remote body was encrypted. Once
+    /// encrypted, silently accepting plaintext would enable an HTTP downgrade.
+    /// Missing means the state was written by an older Vibekey version.
+    pub remote_encrypted: Option<bool>,
     /// ETag returned by the server, used for If-Match writes.
     pub remote_etag: Option<String>,
     pub last_sync_unix: Option<i64>,

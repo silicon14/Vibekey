@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use vibekey_core::crypto::{decrypt_config, validate_password, CryptoError};
 use vibekey_core::keymap::SLOT_KEYS;
 use vibekey_core::sync::{UreqWebDav, WebDav};
-use vibekey_core::{ActivationMode, Config, InputMethod, Keymap, SecretStore, Snippet};
+use vibekey_core::{ActivationMode, Config, InputMethod, Keymap, SecretKind, SecretStore, Snippet};
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, DrawFocusRect, EndPaint, InvalidateRect, SetBkColor, SetBkMode, SetTextColor,
@@ -71,6 +72,10 @@ const ID_TEST: i32 = 407;
 const ID_CLEAR_PASSWORD: i32 = 408;
 const ID_TIMEOUT: i32 = 409;
 const ID_PASSWORD_STATE: i32 = 410;
+const ID_ENCRYPT: i32 = 411;
+const ID_ENCRYPTION_PASSWORD: i32 = 412;
+const ID_CLEAR_ENCRYPTION_PASSWORD: i32 = 413;
+const ID_ENCRYPTION_PASSWORD_STATE: i32 = 414;
 
 const ID_INPUT_METHOD: i32 = 500;
 const ID_ACTIVATION: i32 = 501;
@@ -155,6 +160,11 @@ struct SyncControls {
     password: HWND,
     password_state: HWND,
     clear_password: HWND,
+    encrypt: HWND,
+    encryption_password_label: HWND,
+    encryption_password: HWND,
+    encryption_password_state: HWND,
+    clear_encryption_password: HWND,
     interval_label: HWND,
     interval: HWND,
     timeout_label: HWND,
@@ -188,6 +198,7 @@ struct SettingsState {
     test_result: Arc<Mutex<Option<(bool, String)>>>,
     test_running: bool,
     clear_password_requested: bool,
+    clear_encryption_password_requested: bool,
     selected_snippet: Option<usize>,
     snippet_indices: Vec<usize>,
     snippet_filter: String,
@@ -270,6 +281,7 @@ pub fn open(
         test_result: Arc::new(Mutex::new(None)),
         test_running: false,
         clear_password_requested: false,
+        clear_encryption_password_requested: false,
         selected_snippet: None,
         snippet_indices: Vec::new(),
         snippet_filter: String::new(),
@@ -663,7 +675,18 @@ unsafe fn create_sync_controls(state: &mut SettingsState) {
     c.password = edit(page, "", ID_PASSWORD, true);
     cue_banner(c.password, "留空则保留已保存密码");
     c.password_state = small_label(page, "", ID_PASSWORD_STATE);
-    c.clear_password = button(page, "清除已保存密码", ID_CLEAR_PASSWORD, false);
+    c.clear_password = button(page, "清除登录密码", ID_CLEAR_PASSWORD, false);
+    c.encrypt = checkbox(
+        page,
+        "加密远端配置正文（HTTP 下也保护片段内容）",
+        config.encrypt,
+        ID_ENCRYPT,
+    );
+    c.encryption_password_label = small_label(page, "独立同步加密密码（至少 8 个字符）", -1);
+    c.encryption_password = edit(page, "", ID_ENCRYPTION_PASSWORD, true);
+    cue_banner(c.encryption_password, "与登录密码分开；留空保留已存密码");
+    c.encryption_password_state = small_label(page, "", ID_ENCRYPTION_PASSWORD_STATE);
+    c.clear_encryption_password = button(page, "清除加密密码", ID_CLEAR_ENCRYPTION_PASSWORD, false);
     c.interval_label = small_label(page, "同步间隔（分钟，0 = 不定时）", -1);
     c.interval = edit(
         page,
@@ -686,7 +709,7 @@ unsafe fn create_sync_controls(state: &mut SettingsState) {
         ID_BACKUP,
     );
     c.test = button(page, "测试连接", ID_TEST, false);
-    c.test_hint = small_label(page, "测试使用当前填写内容，不会保存密码。", -1);
+    c.test_hint = small_label(page, "测试会验证加密密码；新密码在成功同步后完成替换。", -1);
 }
 
 fn window_text(hwnd: HWND) -> String {
@@ -1280,7 +1303,7 @@ fn layout_behavior_compact(c: &BehaviorControls, width: i32, height: i32) {
 fn layout_sync(state: &mut SettingsState, height: i32) {
     let c = &state.sync;
     let width = page_width(state, PAGE_SYNC);
-    if height < util::scale(400) {
+    if height < util::scale(440) {
         layout_sync_compact(c, width, height);
         return;
     }
@@ -1293,7 +1316,21 @@ fn layout_sync(state: &mut SettingsState, height: i32) {
     unsafe {
         ShowWindow(c.test_hint, SW_SHOW);
     }
-    move_window(c.enabled, m, util::scale(16), inner, util::scale(26));
+    let test_width = util::scale(108);
+    move_window(
+        c.enabled,
+        m,
+        util::scale(16),
+        inner - test_width - util::scale(12),
+        util::scale(26),
+    );
+    move_window(
+        c.test,
+        width - m - test_width,
+        util::scale(16),
+        test_width,
+        util::scale(30),
+    );
     move_window(c.url_label, m, util::scale(54), inner, util::scale(20));
     move_window(c.url, m, util::scale(76), inner, util::scale(30));
     move_window(c.user_label, m, util::scale(118), column, util::scale(20));
@@ -1336,28 +1373,61 @@ fn layout_sync(state: &mut SettingsState, height: i32) {
         util::scale(20),
     );
     move_window(c.timeout, right, util::scale(240), column, util::scale(30));
+    move_window(c.encrypt, m, util::scale(278), inner, util::scale(24));
     move_window(
-        c.sync_on_change,
+        c.encryption_password_label,
         m,
-        util::scale(292),
-        inner,
-        util::scale(24),
+        util::scale(304),
+        column,
+        util::scale(20),
     );
-    move_window(c.backup, m, util::scale(322), inner, util::scale(24));
     move_window(
-        c.test,
+        c.encryption_password_state,
+        right,
+        util::scale(304),
+        column,
+        util::scale(20),
+    );
+    move_window(
+        c.encryption_password,
         m,
-        height - util::scale(46),
-        util::scale(108),
+        util::scale(326),
+        column,
         util::scale(30),
     );
     move_window(
-        c.test_hint,
-        m + util::scale(122),
-        height - util::scale(42),
-        inner - util::scale(122),
+        c.clear_encryption_password,
+        right,
+        util::scale(326),
+        column,
+        util::scale(30),
+    );
+    move_window(
+        c.sync_on_change,
+        m,
+        util::scale(368),
+        inner,
         util::scale(24),
     );
+    move_window(c.backup, m, util::scale(396), inner, util::scale(24));
+    move_window(
+        c.test_hint,
+        m,
+        height - util::scale(24),
+        inner,
+        util::scale(20),
+    );
+    // SAFETY: the hint is a live child; shorter forms use the compact layout.
+    unsafe {
+        ShowWindow(
+            c.test_hint,
+            if height >= util::scale(460) {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+    }
 }
 
 /// Compact sync form: the test action moves beside the enable checkbox so it
@@ -1383,61 +1453,90 @@ fn layout_sync_compact(c: &SyncControls, width: i32, height: i32) {
         test_width,
         util::scale(28),
     );
-    move_window(c.url_label, m, util::scale(50), inner, util::scale(18));
-    move_window(c.url, m, util::scale(70), inner, util::scale(28));
-    move_window(c.user_label, m, util::scale(108), column, util::scale(18));
-    move_window(c.user, m, util::scale(128), column, util::scale(28));
+    move_window(c.url_label, m, util::scale(44), inner, util::scale(18));
+    move_window(c.url, m, util::scale(64), inner, util::scale(28));
+    move_window(c.user_label, m, util::scale(96), column, util::scale(18));
+    move_window(c.user, m, util::scale(116), column, util::scale(28));
     move_window(
         c.password_label,
         right,
-        util::scale(108),
+        util::scale(96),
         column,
         util::scale(18),
     );
-    move_window(c.password, right, util::scale(128), column, util::scale(28));
+    move_window(c.password, right, util::scale(116), column, util::scale(28));
     move_window(
         c.password_state,
         m,
-        util::scale(164),
+        util::scale(144),
         inner - util::scale(142),
         util::scale(20),
     );
     move_window(
         c.clear_password,
         width - m - util::scale(132),
-        util::scale(160),
+        util::scale(144),
         util::scale(132),
         util::scale(28),
     );
     move_window(
         c.interval_label,
         m,
-        util::scale(198),
+        util::scale(164),
         column,
         util::scale(18),
     );
-    move_window(c.interval, m, util::scale(218), column, util::scale(28));
+    move_window(c.interval, m, util::scale(184), column, util::scale(28));
     move_window(
         c.timeout_label,
         right,
-        util::scale(198),
+        util::scale(164),
         column,
         util::scale(18),
     );
-    move_window(c.timeout, right, util::scale(218), column, util::scale(28));
+    move_window(c.timeout, right, util::scale(184), column, util::scale(28));
+    move_window(c.encrypt, m, util::scale(216), inner, util::scale(22));
+    move_window(
+        c.encryption_password_label,
+        m,
+        util::scale(238),
+        column,
+        util::scale(18),
+    );
+    move_window(
+        c.encryption_password_state,
+        right,
+        util::scale(238),
+        column,
+        util::scale(18),
+    );
+    move_window(
+        c.encryption_password,
+        m,
+        util::scale(258),
+        column,
+        util::scale(28),
+    );
+    move_window(
+        c.clear_encryption_password,
+        right,
+        util::scale(258),
+        column,
+        util::scale(28),
+    );
     move_window(
         c.sync_on_change,
         m,
-        util::scale(254),
+        util::scale(288),
         inner,
-        util::scale(22),
+        util::scale(20),
     );
-    move_window(c.backup, m, util::scale(280), inner, util::scale(22));
-    let show_hint = height >= util::scale(330);
+    move_window(c.backup, m, util::scale(310), inner, util::scale(20));
+    let show_hint = height >= util::scale(400);
     move_window(
         c.test_hint,
         m,
-        height - util::scale(28),
+        height - util::scale(24),
         inner,
         util::scale(20),
     );
@@ -1459,10 +1558,7 @@ fn select_page(state: &mut SettingsState, page: usize) {
             "输入与快捷键",
             "调整输入体验、触发节奏和全局快捷键，让 Vibekey 更贴合你的习惯。",
         ),
-        _ => (
-            "同步与备份",
-            "通过 WebDAV 在多设备间共享配置；密码仅保存在本机。",
-        ),
+        _ => ("同步与备份", "两类密码分开保存；远端配置正文可加密保护。"),
     };
     set_text(state.header_title, title);
     set_text(state.header_subtitle, subtitle);
@@ -1742,17 +1838,31 @@ fn insert_variable(state: &mut SettingsState) {
 
 fn update_password_state(state: &mut SettingsState) {
     let message = if state.clear_password_requested {
-        "保存后清除已保存密码".to_string()
+        "保存后清除登录密码".to_string()
     } else if !window_text(state.sync.password).is_empty() {
-        "将使用当前输入的新密码".to_string()
+        "将使用当前输入的 WebDAV 密码".to_string()
     } else {
-        match state.secrets.load_password() {
-            Ok(Some(_)) => "已安全保存；留空不会修改".to_string(),
-            Ok(None) => "尚未保存密码".to_string(),
-            Err(_) => "无法读取密码状态（详见日志）".to_string(),
+        match state.secrets.load(SecretKind::WebDav) {
+            Ok(Some(_)) => "登录密码已安全保存；留空不修改".to_string(),
+            Ok(None) => "匿名连接可留空".to_string(),
+            Err(_) => "无法读取登录密码状态".to_string(),
         }
     };
     set_text(state.sync.password_state, &message);
+
+    let message = if state.clear_encryption_password_requested {
+        "保存后清除加密密码".to_string()
+    } else if !window_text(state.sync.encryption_password).is_empty() {
+        "新密码将在成功同步后完成替换".to_string()
+    } else {
+        match state.secrets.load_encryption_passwords() {
+            Ok((Some(_), Some(_))) => "等待成功同步后删除旧密码".to_string(),
+            Ok((Some(_), None)) => "加密密码已安全保存；留空不修改".to_string(),
+            Ok((None, _)) => "启用加密前必须设置独立密码".to_string(),
+            Err(_) => "无法读取加密密码状态".to_string(),
+        }
+    };
+    set_text(state.sync.encryption_password_state, &message);
 }
 
 fn confirm_discard(state: &SettingsState) -> bool {
@@ -1843,6 +1953,19 @@ unsafe extern "system" fn settings_proc(
                     update_password_state(state);
                     mark_dirty(state);
                 }
+                ID_CLEAR_ENCRYPTION_PASSWORD => {
+                    state.clear_encryption_password_requested = true;
+                    set_text(state.sync.encryption_password, "");
+                    update_password_state(state);
+                    mark_dirty(state);
+                }
+                ID_ENCRYPTION_PASSWORD if notification == EN_CHANGE => {
+                    if !window_text(state.sync.encryption_password).is_empty() {
+                        state.clear_encryption_password_requested = false;
+                    }
+                    update_password_state(state);
+                    mark_dirty(state);
+                }
                 ID_TEST => test_connection(state),
                 ID_OPEN_CONFIG => {
                     if let Err(error) = std::process::Command::new("notepad.exe")
@@ -1856,8 +1979,8 @@ unsafe extern "system" fn settings_proc(
                         );
                     }
                 }
-                ID_SYNC_ENABLED | ID_SYNC_ON_CHANGE | ID_BACKUP | ID_RESTORE_CLIPBOARD
-                | ID_AUTOSTART => mark_dirty(state),
+                ID_SYNC_ENABLED | ID_SYNC_ON_CHANGE | ID_BACKUP | ID_ENCRYPT
+                | ID_RESTORE_CLIPBOARD | ID_AUTOSTART => mark_dirty(state),
                 ID_URL | ID_USER | ID_INTERVAL | ID_TIMEOUT | ID_HOLD_MS | ID_LIST_HOTKEY
                 | ID_CONFIG_HOTKEY | ID_HISTORY_HOTKEY | ID_IGNORE_APPS
                     if notification == EN_CHANGE =>
@@ -2058,12 +2181,17 @@ fn control_color(message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         match message {
             WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
                 let id = GetDlgCtrlID(control);
-                let color: COLORREF =
-                    if matches!(id, ID_HEADER_SUBTITLE | ID_STATUS | ID_PASSWORD_STATE) {
-                        theme::TEXT_MUTED
-                    } else {
-                        theme::TEXT
-                    };
+                let color: COLORREF = if matches!(
+                    id,
+                    ID_HEADER_SUBTITLE
+                        | ID_STATUS
+                        | ID_PASSWORD_STATE
+                        | ID_ENCRYPTION_PASSWORD_STATE
+                ) {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::TEXT
+                };
                 SetTextColor(wparam as _, color);
                 let parent = GetParent(control);
                 let parent_class = util::window_class_name(parent);
@@ -2345,6 +2473,7 @@ fn save(state: &mut SettingsState) -> bool {
     config.sync.username = window_text(state.sync.user).trim().to_string();
     config.sync.sync_on_change = checked(state.sync.sync_on_change);
     config.sync.backup_on_conflict = checked(state.sync.backup);
+    config.sync.encrypt = checked(state.sync.encrypt);
     config.start_with_windows = checked(state.behavior.autostart);
     config.restore_clipboard = checked(state.behavior.restore_clipboard);
     config.input_method = if combo_selection(state.behavior.input_method) == 0 {
@@ -2410,6 +2539,30 @@ fn save(state: &mut SettingsState) -> bool {
         }
     }
 
+    let encryption_password = window_text(state.sync.encryption_password);
+    if !encryption_password.is_empty() && validate_password(&encryption_password).is_err() {
+        util::message_box_error(
+            state.hwnd,
+            "配置加密密码至少需要 8 个字符（中文也按字符计）。",
+            "保存失败",
+        );
+        select_page(state, PAGE_SYNC);
+        return false;
+    }
+    if !encryption_password.is_empty() {
+        if let Ok((Some(current), Some(_))) = state.secrets.load_encryption_passwords() {
+            if current != encryption_password {
+                util::message_box_error(
+                    state.hwnd,
+                    "上一次加密密码轮换尚未确认。请先完成一次成功同步，再更换为新密码；这样可避免远端密码丢失。",
+                    "保存失败",
+                );
+                select_page(state, PAGE_SYNC);
+                return false;
+            }
+        }
+    }
+
     if config.sync.enabled {
         if config.sync.url.is_empty() {
             util::message_box_error(state.hwnd, "启用同步时必须填写 WebDAV 地址。", "保存失败");
@@ -2424,6 +2577,37 @@ fn save(state: &mut SettingsState) -> bool {
             );
             select_page(state, PAGE_SYNC);
             return false;
+        }
+        if config.sync.encrypt && encryption_password.is_empty() {
+            if state.clear_encryption_password_requested {
+                util::message_box_error(
+                    state.hwnd,
+                    "启用配置加密时不能清除加密密码。请先关闭加密或输入新密码。",
+                    "保存失败",
+                );
+                select_page(state, PAGE_SYNC);
+                return false;
+            }
+            match state.secrets.load(SecretKind::ConfigEncryption) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    util::message_box_error(
+                        state.hwnd,
+                        "启用配置加密前，请填写至少 8 个字符的独立同步加密密码。",
+                        "保存失败",
+                    );
+                    select_page(state, PAGE_SYNC);
+                    return false;
+                }
+                Err(error) => {
+                    util::message_box_error(
+                        state.hwnd,
+                        &format!("无法读取已保存的加密密码：{error}"),
+                        "保存失败",
+                    );
+                    return false;
+                }
+            }
         }
     }
 
@@ -2462,13 +2646,43 @@ fn save(state: &mut SettingsState) -> bool {
 
     let password = window_text(state.sync.password);
     if state.clear_password_requested {
-        if let Err(error) = state.secrets.clear_password() {
-            util::message_box_error(state.hwnd, &format!("无法清除密码：{error}"), "保存失败");
+        if let Err(error) = state.secrets.clear(SecretKind::WebDav) {
+            util::message_box_error(
+                state.hwnd,
+                &format!("无法清除登录密码：{error}"),
+                "保存失败",
+            );
             return false;
         }
     } else if !password.is_empty() {
-        if let Err(error) = state.secrets.store_password(&password) {
-            util::message_box_error(state.hwnd, &format!("无法保存密码：{error}"), "保存失败");
+        if let Err(error) = state.secrets.store(SecretKind::WebDav, &password) {
+            util::message_box_error(
+                state.hwnd,
+                &format!("无法保存登录密码：{error}"),
+                "保存失败",
+            );
+            return false;
+        }
+    }
+    if state.clear_encryption_password_requested {
+        if let Err(error) = state.secrets.clear(SecretKind::ConfigEncryption) {
+            util::message_box_error(
+                state.hwnd,
+                &format!("无法清除加密密码：{error}"),
+                "保存失败",
+            );
+            return false;
+        }
+    } else if !encryption_password.is_empty() {
+        if let Err(error) = state
+            .secrets
+            .store(SecretKind::ConfigEncryption, &encryption_password)
+        {
+            util::message_box_error(
+                state.hwnd,
+                &format!("无法保存加密密码：{error}"),
+                "保存失败",
+            );
             return false;
         }
     }
@@ -2490,7 +2704,9 @@ fn save(state: &mut SettingsState) -> bool {
     state.original_mtime = file_mtime(&state.config_path);
     state.loading = true;
     set_text(state.sync.password, "");
+    set_text(state.sync.encryption_password, "");
     state.clear_password_requested = false;
+    state.clear_encryption_password_requested = false;
     update_password_state(state);
     state.loading = false;
     state.dirty = false;
@@ -2535,28 +2751,92 @@ fn test_connection(state: &mut SettingsState) {
         );
         return;
     } else {
-        match state.secrets.load_password() {
+        match state.secrets.load(SecretKind::WebDav) {
             Ok(Some(saved)) => saved,
+            Ok(None) if username.is_empty() => String::new(),
             Ok(None) => {
-                util::message_box_warning(state.hwnd, "请先填写密码。", "测试连接");
+                util::message_box_warning(state.hwnd, "请先填写 WebDAV 密码。", "测试连接");
                 return;
             }
             Err(error) => {
                 util::message_box_error(
                     state.hwnd,
-                    &format!("无法读取已保存的密码：{error}"),
+                    &format!("无法读取已保存的 WebDAV 密码：{error}"),
                     "测试连接",
                 );
                 return;
             }
         }
     };
+    let encryption_enabled = checked(state.sync.encrypt);
+    let entered_encryption_password = window_text(state.sync.encryption_password);
+    if !entered_encryption_password.is_empty()
+        && validate_password(&entered_encryption_password).is_err()
+    {
+        util::message_box_warning(
+            state.hwnd,
+            "配置加密密码至少需要 8 个字符（中文也按字符计）。",
+            "测试连接",
+        );
+        return;
+    }
+    let (saved_current, saved_previous) = match state.secrets.load_encryption_passwords() {
+        Ok(pair) => pair,
+        Err(error) => {
+            util::message_box_error(
+                state.hwnd,
+                &format!("无法读取已保存的加密密码：{error}"),
+                "测试连接",
+            );
+            return;
+        }
+    };
+    let encryption_passwords = if !entered_encryption_password.is_empty() {
+        if saved_previous.is_some()
+            && saved_current.as_deref() != Some(entered_encryption_password.as_str())
+        {
+            util::message_box_warning(
+                state.hwnd,
+                "上一次加密密码轮换尚未确认，请先成功同步，再测试另一个新密码。",
+                "测试连接",
+            );
+            return;
+        }
+        let previous = if saved_current.as_deref() == Some(entered_encryption_password.as_str()) {
+            saved_previous
+        } else {
+            // Testing a first replacement must model exactly what Apply will
+            // persist: new current + the old current as one-time fallback.
+            saved_current
+        };
+        [Some(entered_encryption_password), previous]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    } else if state.clear_encryption_password_requested {
+        Vec::new()
+    } else {
+        [saved_current, saved_previous]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    if encryption_enabled && encryption_passwords.is_empty() {
+        util::message_box_warning(
+            state.hwnd,
+            "已启用配置加密，请先填写独立同步加密密码。",
+            "测试连接",
+        );
+        return;
+    }
     let timeout = window_text(state.sync.timeout)
         .trim()
         .parse::<u64>()
         .unwrap_or(20)
         .max(1);
 
+    let disable_encryption_allowed =
+        vibekey_core::sync::last_state(&state.config_path).remote_encrypted == Some(true);
     state.test_running = true;
     set_enabled(state.sync.test, false);
     let result_slot = Arc::clone(&state.test_result);
@@ -2566,13 +2846,30 @@ fn test_connection(state: &mut SettingsState) {
         .spawn(move || {
             let dav = UreqWebDav::new(&username, &password, Duration::from_secs(timeout));
             let (ok, message) = match dav.get(&url) {
+                Ok(Some(remote)) if remote.encrypted => encryption_test_result(
+                    &remote.body,
+                    &encryption_passwords,
+                    encryption_enabled,
+                    disable_encryption_allowed,
+                ),
                 Ok(Some(remote)) => (
                     true,
-                    format!("连接成功，远端配置文件 {} 字节。", remote.body.len()),
+                    if encryption_enabled {
+                        format!(
+                            "连接成功；远端当前是 {} 字节的明文配置，下次同步会加密迁移。",
+                            remote.body.len()
+                        )
+                    } else {
+                        format!("连接成功，远端配置文件 {} 字节。", remote.body.len())
+                    },
                 ),
                 Ok(None) => (
                     true,
-                    "连接成功，但远端文件还不存在（首次同步时会上传）。".to_string(),
+                    if encryption_enabled {
+                        "连接成功，远端文件尚不存在；首次同步会加密上传。".to_string()
+                    } else {
+                        "连接成功，但远端文件还不存在（首次同步时会上传）。".to_string()
+                    },
                 ),
                 Err(error) => (false, format!("连接失败：{error}")),
             };
@@ -2589,6 +2886,67 @@ fn test_connection(state: &mut SettingsState) {
         set_enabled(state.sync.test, true);
         util::message_box_error(state.hwnd, "无法启动测试线程。", "测试连接");
     }
+}
+
+fn encryption_test_result(
+    body: &[u8],
+    passwords: &[String],
+    encryption_enabled: bool,
+    disable_encryption_allowed: bool,
+) -> (bool, String) {
+    if !encryption_enabled && !disable_encryption_allowed {
+        return (
+            false,
+            "远端已加密；请先勾选配置加密并成功同步，之后才能主动关闭加密。".to_string(),
+        );
+    }
+    if passwords.is_empty() {
+        return (
+            false,
+            "连接成功，但远端配置已加密；请填写独立同步加密密码。".to_string(),
+        );
+    }
+    for (index, password) in passwords.iter().enumerate() {
+        match decrypt_config(body, password) {
+            Ok(plain) => {
+                let used_previous = index > 0;
+                let message = match (used_previous, encryption_enabled) {
+                    (false, true) => format!(
+                        "连接及当前加密密码验证成功；远端密文 {} 字节，解密后 {} 字节。",
+                        body.len(),
+                        plain.len()
+                    ),
+                    (true, true) => format!(
+                        "连接成功；旧密码可解密，保存并同步后即可完成密码轮换（解密后 {} 字节）。",
+                        plain.len()
+                    ),
+                    (false, false) => format!(
+                        "连接及密码验证成功；保存并同步后可迁移为明文（解密后 {} 字节）。",
+                        plain.len()
+                    ),
+                    (true, false) => format!(
+                        "连接成功；旧密码可解密，保存并同步后可关闭配置加密（解密后 {} 字节）。",
+                        plain.len()
+                    ),
+                };
+                return (true, message);
+            }
+            Err(CryptoError::InvalidFormat) => {
+                return (
+                    false,
+                    "连接成功，但远端加密格式无效或版本不受支持。".to_string(),
+                );
+            }
+            Err(_) => {
+                // GCM intentionally cannot distinguish a wrong password from
+                // tampering. Try the one-time rotation fallback, if present.
+            }
+        }
+    }
+    (
+        false,
+        "连接成功，但加密密码错误，或远端内容已被篡改。".to_string(),
+    )
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {

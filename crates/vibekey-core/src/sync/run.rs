@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::config::SyncConfig;
 use crate::state::SyncState;
 
-use super::engine::{SyncEngine, SyncError, SyncOutcome};
+use super::engine::{SyncEngine, SyncError, SyncOutcome, SyncProtection};
 use super::webdav::UreqWebDav;
 
 /// Synchronise the configuration file once.
@@ -32,6 +32,25 @@ pub fn sync_once(
     password: Option<&str>,
     timestamp: &str,
 ) -> Result<(SyncOutcome, SyncState), SyncError> {
+    sync_once_protected(
+        config_path,
+        sync,
+        password,
+        SyncProtection::disabled(),
+        timestamp,
+    )
+}
+
+/// Protected variant of [`sync_once`]. Password rotation cleanup deliberately
+/// remains with the platform secret store: callers must save the returned state
+/// successfully before committing the previous-password deletion.
+pub fn sync_once_protected(
+    config_path: &Path,
+    sync: &SyncConfig,
+    password: Option<&str>,
+    protection: SyncProtection,
+    timestamp: &str,
+) -> Result<(SyncOutcome, SyncState), SyncError> {
     let state_path = SyncState::path_for(config_path);
     let mut state = SyncState::load(&state_path);
 
@@ -40,7 +59,8 @@ pub fn sync_once(
         password.unwrap_or(""),
         Duration::from_secs(sync.timeout_secs),
     );
-    let engine = SyncEngine::new(&dav, &sync.url, config_path, sync.backup_on_conflict);
+    let engine = SyncEngine::new(&dav, &sync.url, config_path, sync.backup_on_conflict)
+        .with_protection(protection);
 
     match engine.sync(&mut state, timestamp) {
         Ok(outcome) => {

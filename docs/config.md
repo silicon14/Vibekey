@@ -24,7 +24,8 @@ Windows 上配置文件位于应用数据目录：
 | 文件 | 说明 |
 | --- | --- |
 | `config.toml` | 本文件，手动编辑或由设置窗口保存 |
-| `secret.bin` | 经 Windows DPAPI 加密的 WebDAV 密码，**不会**被同步 |
+| `secret.bin` | 经 Windows DPAPI 加密的 WebDAV 登录密码，**不会**被同步 |
+| `sync-encryption.bin` | 经 DPAPI 加密的独立配置同步密码及轮换旧密码，**不会**被同步 |
 | `sync-state.json` | 同步状态（本地/远端内容 hash、ETag、上次同步时间），仅本机使用 |
 | `sync-state.json.tmp` | 保存状态时的临时文件 |
 | `config.toml.tmp` | 原子保存配置时的临时文件 |
@@ -135,15 +136,18 @@ alt+grave    # 反引号的别名
 | `username` | 字符串 | `""` | WebDAV 用户名。为空时不发送认证头。 |
 | `interval_minutes` | 整数 | `15` | 每隔多少分钟自动同步一次；`0` 表示不定时，只在手动或保存配置时同步（会产生警告）。 |
 | `sync_on_change` | 布尔 | `true` | 保存配置后立即同步一次。 |
-| `backup_on_conflict` | 布尔 | `true` | 两端都修改时，先把远端版本备份为 `<url>.remote-backup-<时间戳>.toml`，再用本地版本覆盖远端。 |
+| `backup_on_conflict` | 布尔 | `true` | 两端都修改时，先把远端版本备份为 `<url>.remote-backup-<时间戳>.toml`，再用本地版本覆盖远端；启用加密后备份也为密文。 |
+| `encrypt` | 布尔 | `false` | 上传前用独立同步密码进行 AES-256-GCM 加密与完整性认证；密钥由 PBKDF2-HMAC-SHA256（600,000 次）派生。旧配置缺字段时保持明文模式。 |
 | `timeout_secs` | 整数 | `20` | 网络连接/读/写超时（秒），必须大于 0。 |
 
-**密码不在这个文件里。** 密码通过设置窗口输入，Windows 上由 DPAPI 加密后保存在
-`%APPDATA%\Vibekey\secret.bin`，只有当前 Windows 用户可以解密。因此：
+**两类密码都不在这个文件里。** WebDAV 登录密码和独立配置加密密码分别在设置窗口输入，Windows 上由 DPAPI 保存到
+`%APPDATA%\Vibekey\secret.bin` 与 `sync-encryption.bin`，只有当前 Windows 用户可以解密。因此：
 
-- 同步出去的 `config.toml` 不含任何秘密，可以放心放进版本库。
-- 换机器或重装系统后需要重新输入一次密码。
-- 日志中不会出现明文密码。
+- 配置加密密码至少有 8 个字符；换机器或重装系统后需要重新输入，才能解密已有远端。
+- 更换加密密码时旧密码暂存于同一个 DPAPI blob，只有新密文上传且同步状态保存成功后才删除；失败可安全重试。一次轮换未确认前不能再次换成第三个密码。
+- 本地 `config.toml` 与 `config.toml.bak` 始终是可编辑的明文；加密只保护 WebDAV 主文件和远端冲突备份。
+- HTTP 下配置正文不直接暴露，但 Basic 登录凭据、URL 和元数据仍不受此功能保护，正式使用仍需 HTTPS。
+- 日志不会记录两类明文密码；忘记配置加密密码无法从密文恢复。
 
 同步的冲突策略、各服务商 URL 示例见 [webdav.md](webdav.md)。
 
@@ -220,6 +224,7 @@ username = "me"
 interval_minutes = 15
 sync_on_change = true
 backup_on_conflict = true
+encrypt = true
 timeout_secs = 20
 
 [[snippet]]
