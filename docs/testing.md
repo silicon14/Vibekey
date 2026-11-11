@@ -112,7 +112,8 @@ DPAPI blob 与 TOML 均不含 dummy 明文、清除后 sync-encryption.bin 删�
 - [ ] Windows 7 SP1 x64 上运行 x64 版；32 位 Win7 SP1（或 WoW64 下运行 x86 版）均可启动。
 - [ ] 未安装 UCRT / .NET 的干净 Win7 可运行（exe 只依赖系统 DLL）。
 - [ ] 用 llvm-readobj 校验产物：Subsystem 6.1，无 api-ms-win-* / ucrtbase / libunwind.dll 导入
-      （scripts/verify-win7-pe.sh 自动检查）。
+      （scripts/verify-win7-pe.sh 自动检查）。MSVC 路线还需明确无 VCRUNTIME，并用 +crt-static 重建。
+      2026-11-11 x64/x86 MSVC 专用构建已通过 dumpbin 静态检查；真实 Win7 运行仍待确认。
 - [ ] HTTPS WebDAV（Nextcloud 等）能在 Win7 上完成 TLS 握手（rustls 内置根证书，不依赖系统根证书）。
 - [ ] 中文用户名路径（%APPDATA% 含中文）下配置与日志正常读写。
 

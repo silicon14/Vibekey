@@ -118,9 +118,17 @@ cargo build --release -p vibekey
 ~~~
 
 注意这个 MSVC/stable 产物**不能**在 Win7 上运行（原因见第一节）。要在 Windows 上
-编出 Win7 版本，需要 nightly + rust-src + `-Z build-std`，并使用
-`x86_64-win7-windows-msvc` 目标；本项目的发布脚本和 CI 走的是 Linux + llvm-mingw
-的 gnu 路线，msvc 路线未纳入自动验证。
+编出 Win7 版本，需要 nightly + rust-src + `-Z build-std`，并使用 Win7 target。
+同时必须静态链接 CRT 并固定子系统版本，否则即使时间函数正确，也会出现 VCRUNTIME/UCRT 依赖：
+
+    rustup toolchain install nightly --profile minimal --component rust-src
+    set RUSTFLAGS=-C target-feature=+crt-static -C link-arg=/SUBSYSTEM:WINDOWS,6.01
+    cargo +nightly build --release -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc -p vibekey
+    cargo +nightly build --release -Z build-std=std,panic_abort --target i686-win7-windows-msvc -p vibekey
+
+本项目的发布脚本和 CI 走的是 Linux + llvm-mingw 的 gnu 路线，msvc 路线未纳入自动验证。
+2026-11-11 本机以以上参数构建 x64/x86 后，二者 PE 子系统均为 6.01，导入表均无
+GetSystemTimePreciseAsFileTime、api-ms-win-*、VCRUNTIME 或 UCRT；真实 Win7 机器仍须继续按 testing.md 验收。
 
 ## 校验产物是否兼容 Win7
 

@@ -102,6 +102,9 @@ Win7 目标（x86_64-win7-windows-msvc / i686-win7-windows-msvc）是 tier-3，�
 
     rustup toolchain install nightly --profile minimal --component rust-src
 
+    # 必须静态链接 CRT 并固定子系统 6.1；否则干净 Win7 会缺 VCRUNTIME/UCRT
+    set RUSTFLAGS=-C target-feature=+crt-static -C link-arg=/SUBSYSTEM:WINDOWS,6.01
+
     # 64 位
     cargo +nightly build --release -Z build-std=std,panic_abort ^
         --target x86_64-win7-windows-msvc -p vibekey
