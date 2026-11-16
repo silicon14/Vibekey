@@ -166,7 +166,7 @@ GetGUIThreadInfo 的 rcCaret → ClientToScreen，失败回退 GetCursorPos）�
 画刷与自绘导航/列表，使用 EDIT/BUTTON/COMBOBOX/LISTBOX 程序化创建；消息循环继续用 IsDialogMessageW 支持 Tab 导航。
 窗口分为三个页面；默认采用宽松双栏布局，较矮窗口自动切换紧凑布局，最小尺寸还会按工作区限制：
 
-- 片段库：搜索、owner-drawn 列表、新建/复制/删除；右侧直接编辑名称、12 个 Alt 槽位（或不绑定）、多行正文、
+- 片段库：搜索、owner-drawn 列表、新建/复制/删除、上移/下移排序；右侧直接编辑名称、12 个 Alt 槽位（或不绑定）、多行正文、
   send_enter、enabled；模板变量 combo + 插入按钮用 EM_REPLACESEL 插入到当前光标。
 - 输入与快捷键：paste/type、restore_clipboard、immediate/hold、hold_ms、start_with_windows、list/config/history
   三个全局热键、ignore_apps。所有 Config 行为字段都有图形化入口。
@@ -174,7 +174,8 @@ GetGUIThreadInfo 的 rcCaret → ClientToScreen，失败回退 GetCursorPos）�
   sync_on_change、backup_on_conflict、测试连接和分别清除两类密码。加密密码至少 8 个字符；测试发现加密远端时必须在后台线程
   实际解密验证。密码只走 SecretStore，清除操作在应用时执行，留空保留。
 
-编辑先更新窗口内 Config 工作副本，取消/关闭有未保存确认，不直接写文件。应用/保存流程：
+排序按 snippet_indices 当前可见顺序交换 Config.snippet 中的两个实际项，保留被移动项的新实际索引；过滤时同样只比较可见邻居。
+首/末项按钮禁用，刷新后保持片段身份与 Alt 槽位，不能把排序当成位置热键变化。编辑先更新窗口内 Config 工作副本，取消/关闭有未保存确认，不直接写文件。应用/保存流程：
 读取其它页面控件 → 校验数值范围、WebDAV URL 和 Keymap（含重复槽位）→ 检测 external mtime 变化并确认 →
 保存/清除密码 → Config::save 原子写 → 更新开机启动 → PostMessage WM_APP_RELOAD → 按 sync_on_change 请求同步。
 “应用”保持窗口打开，“保存并关闭”随后 DestroyWindow。保存失败显示中文 MessageBox 并保留编辑内容。

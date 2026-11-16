@@ -60,6 +60,8 @@ const ID_SNIPPET_SEND_ENTER: i32 = 308;
 const ID_SNIPPET_ENABLED: i32 = 309;
 const ID_SNIPPET_VARIABLE: i32 = 310;
 const ID_SNIPPET_INSERT_VARIABLE: i32 = 311;
+const ID_SNIPPET_MOVE_UP: i32 = 312;
+const ID_SNIPPET_MOVE_DOWN: i32 = 313;
 
 const ID_SYNC_ENABLED: i32 = 400;
 const ID_URL: i32 = 401;
@@ -109,6 +111,8 @@ struct SnippetControls {
     list: HWND,
     new: HWND,
     duplicate: HWND,
+    move_up: HWND,
+    move_down: HWND,
     editor_heading: HWND,
     name_label: HWND,
     name: HWND,
@@ -557,6 +561,8 @@ unsafe fn create_snippet_controls(state: &mut SettingsState) {
     );
     c.new = button(page, "＋ 新建", ID_SNIPPET_NEW, false);
     c.duplicate = button(page, "复制", ID_SNIPPET_DUPLICATE, false);
+    c.move_up = button(page, "上移", ID_SNIPPET_MOVE_UP, false);
+    c.move_down = button(page, "下移", ID_SNIPPET_MOVE_DOWN, false);
     c.editor_heading = heading(page, "快速编辑");
     c.name_label = small_label(page, "片段名称", -1);
     c.name = edit(page, "", ID_SNIPPET_NAME, false);
@@ -929,21 +935,19 @@ fn layout_snippets(state: &mut SettingsState, height: i32) {
     let list_y = util::scale(78);
     let list_height = (height - list_y - util::scale(54)).max(util::scale(100));
     move_window(c.list, m, list_y, left, list_height);
-    let small_button = (left - util::scale(8)) / 2;
-    move_window(
-        c.new,
-        m,
-        height - util::scale(42),
-        small_button,
-        util::scale(28),
-    );
-    move_window(
-        c.duplicate,
-        m + small_button + util::scale(8),
-        height - util::scale(42),
-        small_button,
-        util::scale(28),
-    );
+    let small_button = (left - util::scale(18)) / 4;
+    for (index, control) in [c.new, c.duplicate, c.move_up, c.move_down]
+        .into_iter()
+        .enumerate()
+    {
+        move_window(
+            control,
+            m + index as i32 * (small_button + util::scale(6)),
+            height - util::scale(42),
+            small_button,
+            util::scale(28),
+        );
+    }
 
     move_window(
         c.editor_heading,
@@ -1696,6 +1700,20 @@ fn load_snippet_editor(state: &mut SettingsState) {
     ] {
         set_enabled(control, enabled);
     }
+    let visible_position = state.selected_snippet.and_then(|selected| {
+        state
+            .snippet_indices
+            .iter()
+            .position(|&index| index == selected)
+    });
+    set_enabled(
+        state.snippets.move_up,
+        visible_position.is_some_and(|position| position > 0),
+    );
+    set_enabled(
+        state.snippets.move_down,
+        visible_position.is_some_and(|position| position + 1 < state.snippet_indices.len()),
+    );
     state.loading = previous_loading;
 }
 
@@ -1772,6 +1790,44 @@ fn duplicate_snippet(state: &mut SettingsState) {
     state.snippet_filter.clear();
     set_text(state.snippets.search, "");
     refresh_snippet_list(state, Some(index + 1));
+    mark_dirty(state);
+}
+
+/// Swap a snippet with its adjacent visible neighbour and return its new
+/// configuration index. Filtering never guesses a position in the full list.
+fn reorder_snippet(
+    snippets: &mut [Snippet],
+    visible_indices: &[usize],
+    selected: usize,
+    direction: i32,
+) -> Option<usize> {
+    let position = visible_indices
+        .iter()
+        .position(|&index| index == selected)?;
+    let neighbour = match direction {
+        -1 => position.checked_sub(1)?,
+        1 => position.checked_add(1)?,
+        _ => return None,
+    };
+    let target = *visible_indices.get(neighbour)?;
+    snippets.swap(selected, target);
+    Some(target)
+}
+
+fn move_selected_snippet(state: &mut SettingsState, direction: i32) {
+    let Some(selected) = state.selected_snippet else {
+        return;
+    };
+    let Some(new_index) = reorder_snippet(
+        &mut state.config.snippet,
+        &state.snippet_indices,
+        selected,
+        direction,
+    ) else {
+        return;
+    };
+    state.selected_snippet = Some(new_index);
+    refresh_snippet_list(state, Some(new_index));
     mark_dirty(state);
 }
 
@@ -1910,6 +1966,8 @@ unsafe extern "system" fn settings_proc(
                 }
                 ID_SNIPPET_NEW => new_snippet(state),
                 ID_SNIPPET_DUPLICATE => duplicate_snippet(state),
+                ID_SNIPPET_MOVE_UP => move_selected_snippet(state, -1),
+                ID_SNIPPET_MOVE_DOWN => move_selected_snippet(state, 1),
                 ID_SNIPPET_DELETE => delete_snippet(state),
                 ID_SNIPPET_INSERT_VARIABLE => insert_variable(state),
                 ID_SNIPPET_LIST if notification == LBN_SELCHANGE as u32 => {
@@ -2989,4 +3047,55 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path)
         .ok()
         .and_then(|metadata| metadata.modified().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snippets() -> Vec<Snippet> {
+        ["A", "B", "C", "D"]
+            .into_iter()
+            .map(|name| Snippet::new("", name, name))
+            .collect()
+    }
+
+    fn names(snippets: &[Snippet]) -> Vec<&str> {
+        snippets
+            .iter()
+            .map(|snippet| snippet.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn reorder_moves_up_and_down_without_losing_identity() {
+        let mut snippets = snippets();
+        let indices = [0, 1, 2, 3];
+        assert_eq!(reorder_snippet(&mut snippets, &indices, 1, -1), Some(0));
+        assert_eq!(names(&snippets), ["B", "A", "C", "D"]);
+        assert_eq!(reorder_snippet(&mut snippets, &indices, 0, 1), Some(1));
+        assert_eq!(names(&snippets), ["A", "B", "C", "D"]);
+        assert_eq!(reorder_snippet(&mut snippets, &indices, 2, 1), Some(3));
+        assert_eq!(names(&snippets), ["A", "B", "D", "C"]);
+    }
+
+    #[test]
+    fn reorder_respects_filtered_order_and_boundaries() {
+        let mut snippets = snippets();
+        let filtered = [0, 2, 3];
+        assert_eq!(reorder_snippet(&mut snippets, &filtered, 2, -1), Some(0));
+        assert_eq!(names(&snippets), ["C", "B", "A", "D"]);
+        assert_eq!(reorder_snippet(&mut snippets, &filtered, 0, -1), None);
+        assert_eq!(reorder_snippet(&mut snippets, &filtered, 3, 1), None);
+        assert_eq!(reorder_snippet(&mut snippets, &filtered, 1, 1), None);
+        assert_eq!(reorder_snippet(&mut snippets, &filtered, 0, 0), None);
+    }
+
+    #[test]
+    fn reorder_empty_or_missing_selection_is_a_noop() {
+        let mut snippets = snippets();
+        assert_eq!(reorder_snippet(&mut snippets, &[], 0, 1), None);
+        assert_eq!(reorder_snippet(&mut snippets, &[0, 1], 2, 1), None);
+        assert_eq!(names(&snippets), ["A", "B", "C", "D"]);
+    }
 }
