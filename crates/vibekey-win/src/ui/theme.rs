@@ -18,17 +18,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_SETFONT};
 
 use crate::util::{scale, wide};
 
-pub const ACCENT: COLORREF = rgb(79, 109, 245);
-pub const ACCENT_DARK: COLORREF = rgb(57, 82, 199);
-pub const ACCENT_SOFT: COLORREF = rgb(234, 239, 255);
-pub const BACKGROUND: COLORREF = rgb(246, 248, 252);
+pub const ACCENT: COLORREF = rgb(15, 108, 189);
+pub const ACCENT_DARK: COLORREF = rgb(17, 94, 163);
+pub const ACCENT_SOFT: COLORREF = rgb(232, 241, 251);
+pub const BACKGROUND: COLORREF = rgb(245, 246, 248);
 pub const SURFACE: COLORREF = rgb(255, 255, 255);
-pub const SIDEBAR: COLORREF = rgb(24, 31, 50);
-pub const SIDEBAR_HOVER: COLORREF = rgb(37, 47, 73);
-pub const TEXT: COLORREF = rgb(31, 41, 55);
-pub const TEXT_MUTED: COLORREF = rgb(103, 115, 137);
-pub const TEXT_ON_DARK: COLORREF = rgb(240, 244, 255);
-pub const BORDER: COLORREF = rgb(224, 229, 239);
+pub const SIDEBAR: COLORREF = rgb(247, 247, 247);
+pub const SIDEBAR_HOVER: COLORREF = rgb(238, 238, 238);
+pub const TEXT: COLORREF = rgb(27, 27, 27);
+pub const TEXT_MUTED: COLORREF = rgb(97, 97, 97);
+pub const BORDER: COLORREF = rgb(225, 225, 225);
 
 /// Construct a Win32 COLORREF (0x00BBGGRR) from familiar RGB components.
 pub const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
@@ -57,7 +56,7 @@ fn objects() -> &'static Objects {
                 body: create_font(14, FW_NORMAL, "Microsoft YaHei UI") as usize,
                 small: create_font(12, FW_NORMAL, "Microsoft YaHei UI") as usize,
                 semibold: create_font(14, FW_SEMIBOLD, "Microsoft YaHei UI") as usize,
-                title: create_font(23, FW_SEMIBOLD, "Microsoft YaHei UI") as usize,
+                title: create_font(20, FW_SEMIBOLD, "Microsoft YaHei UI") as usize,
                 mono: create_font(13, FW_NORMAL, "Consolas") as usize,
                 background: CreateSolidBrush(BACKGROUND) as usize,
                 surface: CreateSolidBrush(SURFACE) as usize,

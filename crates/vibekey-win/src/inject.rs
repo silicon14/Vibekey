@@ -257,8 +257,9 @@ fn deliver(
 
     // The hook swallows Alt+<digit>, so the target window may have entered its
     // menu loop on WM_SYSKEYUP(VK_MENU); injected Ctrl+V/Enter would go to the
-    // menu instead of the document.
-    leave_menu_mode();
+    // menu instead of the document. A focus change during the bounded check
+    // cancels this job rather than typing into an unrelated window.
+    leave_menu_mode()?;
 
     // Check the window that will really receive the input: SetForegroundWindow
     // may have failed, leaving another (possibly elevated) window in front.
@@ -331,23 +332,25 @@ fn is_elevated(hwnd: HWND) -> Option<bool> {
     }
 }
 
-/// Whether the foreground window's thread is inside a menu loop.
-fn foreground_in_menu_mode() -> bool {
+/// Return the foreground window and its UI thread for one injection attempt.
+fn foreground_menu_thread() -> Option<(HWND, u32)> {
     // SAFETY: GetForegroundWindow has no preconditions.
     let foreground = unsafe { GetForegroundWindow() };
     if foreground.is_null() {
-        return false;
+        return None;
     }
     let mut process_id = 0u32;
     // SAFETY: process_id is a valid out pointer.
     let thread_id = unsafe { GetWindowThreadProcessId(foreground, &mut process_id) };
-    if thread_id == 0 {
-        return false;
-    }
+    (thread_id != 0).then_some((foreground, thread_id))
+}
+
+/// Whether a specific UI thread is inside a menu loop.
+fn in_menu_mode(thread_id: u32) -> bool {
     let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
-    // SAFETY: info is initialised with its size and the thread id belongs to the
-    // foreground window's thread; GetGUIThreadInfo only reads.
+    // SAFETY: info is initialised with its size and the thread id was captured
+    // for this injection attempt; GetGUIThreadInfo only reads.
     (unsafe { GetGUIThreadInfo(thread_id, &mut info) }) != 0
         && info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE) != 0
 }
@@ -357,19 +360,46 @@ fn foreground_in_menu_mode() -> bool {
 /// When the hook swallows Alt+<digit>, the target window only sees the Alt key
 /// down/up pair, so DefWindowProc enters its menu loop on WM_SYSKEYUP(VK_MENU).
 /// A paste or Enter would then be routed to the menu instead of the document.
-fn leave_menu_mode() {
-    // Let the target process the Alt key up first: the menu loop is entered by
-    // that message, so immediately after the physical release the target may
-    // still look like "no menu".
-    std::thread::sleep(Duration::from_millis(30));
-    if !foreground_in_menu_mode() {
-        return;
-    }
-    log::info!("target window is in menu mode; pressing Escape before injecting");
-    let _ = tap(VK_ESCAPE);
-    std::thread::sleep(Duration::from_millis(40));
-    if foreground_in_menu_mode() {
-        log::warn!("target window is still in menu mode after Escape");
+/// The target thread is pinned for the whole check: switching foreground must
+/// never close another application's menu or receive the pending text.
+fn leave_menu_mode() -> Result<(), String> {
+    const SETTLE_TIMEOUT: Duration = Duration::from_millis(150);
+    const ESCAPE_TIMEOUT: Duration = Duration::from_millis(250);
+    let Some((target, thread_id)) = foreground_menu_thread() else {
+        return Ok(());
+    };
+    let started = Instant::now();
+    let mut escape_sent_at: Option<Instant> = None;
+    loop {
+        // SAFETY: this only reads the current foreground handle.
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground != target {
+            return Err("目标窗口已切换，已取消本次输入".to_string());
+        }
+
+        if in_menu_mode(thread_id) {
+            if escape_sent_at.is_none() {
+                log::info!("target window is in menu mode; pressing Escape before injecting");
+                let _ = tap(VK_ESCAPE);
+                escape_sent_at = Some(Instant::now());
+            }
+            // Give the target a chance to process Escape, then require an
+            // explicit exit rather than assuming a fixed 30/40 ms delay worked.
+            std::thread::sleep(Duration::from_millis(40));
+            // Always return to the top of the loop after sleeping: every early
+            // return must re-check both foreground and menu state, including a
+            // menu flag that cleared merely because focus moved elsewhere.
+            continue;
+        } else if escape_sent_at.is_some() || started.elapsed() >= SETTLE_TIMEOUT {
+            // No menu appeared during the settle window, or Escape succeeded.
+            return Ok(());
+        }
+
+        if escape_sent_at.is_some_and(|sent| sent.elapsed() >= ESCAPE_TIMEOUT) {
+            log::warn!("target window is still in menu mode after Escape");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

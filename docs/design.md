@@ -81,7 +81,18 @@ LB_SETTOPINDEX=0，避免 ListBox 从第二行开始显示。透明效果使用 
 SetLayeredWindowAttributes，242/255 统一 Alpha；不支持时移除分层样式并保持不透明。这是半透明而非背景模糊。
 原生菜单通过 WM_APP_SHOW_MENU 排队，TrackPopupMenu 前后分别短借用 App，不在模态菜单期间保留 &mut App。
 
-### 4.3 内存文本剪贴板历史
+### 4.3 Fluent 视觉风格与菜单兼容
+
+界面采用 WinUI 3 风格的浅色 Fluent 配色，但不引入 WinUI 3/GPUI/DirectWrite：主色 #0F6CBD、按下 #115EA3、
+浅蓝选中 #E8F1FB，导航和正文使用近白背景与深色文本，页标题为 20px 半粗体。布局、DPI、Win7 API、单 exe 和
+弹窗 Alpha=242 保持不变；普通滚动条、复选框和编辑器仍使用原生控件，不承诺 Mica/Acrylic 或完整 WinUI 控件外观。
+
+Explorer 的 Alt 菜单循环进入时机不固定。注入不再只等待 30ms，而是固定本次目标 HWND/UI thread，在 150ms 沉降窗口内轮询
+GUI_INMENUMODE / GUI_POPUPMENUMODE，检测到菜单后发送一次 Esc，并从实际发送时起以最多 250ms 确认退出。
+这样避免菜单尚未进入就把 Ctrl+V 送到错误焦点，同时不无条件取消地址栏编辑。等待期间若前台窗口变化，取消本次输入，
+不关闭其它应用的菜单，也不把文本送给新前台。
+
+### 4.4 内存文本剪贴板历史
 
 Alt+V 与 Alt+反引号复用同一个紧凑选择器，默认不占用 Windows 10/11 的系统 Win+V；hotkeys.history 可在设置中修改。
 主窗口通过 AddClipboardFormatListener/WM_CLIPBOARDUPDATE 读取 CF_UNICODETEXT，保存最近 50 条，重复文本置顶，

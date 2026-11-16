@@ -479,6 +479,8 @@ impl App {
     /// The template is expanded on the inject worker thread, so the clipboard is
     /// only read by the thread that also owns the clipboard restore.
     pub fn inject_snippet(&mut self, index: usize, target: HWND) {
+        #[cfg(debug_assertions)]
+        log::debug!("inject_snippet called for index {index}, target {target:?}");
         let Some(snippet) = self.config.snippet.get(index) else {
             return;
         };

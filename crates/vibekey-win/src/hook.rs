@@ -397,6 +397,8 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         Binding::History => ACTION_HISTORY,
         Binding::Config => ACTION_CONFIG,
         Binding::Snippet(index) => {
+            #[cfg(debug_assertions)]
+            log::debug!("snippet hotkey matched index {index}, target {foreground:?}");
             shared.push_trigger(ACTION_SNIPPET, foreground);
             let index = index as isize;
             drop(config);

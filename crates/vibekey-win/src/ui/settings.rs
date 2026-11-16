@@ -1314,7 +1314,7 @@ fn layout_behavior_compact(c: &BehaviorControls, width: i32, height: i32) {
 fn layout_sync(state: &mut SettingsState, height: i32) {
     let c = &state.sync;
     let width = page_width(state, PAGE_SYNC);
-    if height < util::scale(480) {
+    if height < util::scale(450) {
         layout_sync_compact(c, width);
         return;
     }
@@ -1477,7 +1477,7 @@ fn layout_sync_compact(c: &SyncControls, width: i32) {
         width - m - util::scale(132),
         util::scale(144),
         util::scale(132),
-        util::scale(28),
+        util::scale(18),
     );
     move_window(
         c.interval_label,
@@ -1515,29 +1515,29 @@ fn layout_sync_compact(c: &SyncControls, width: i32) {
         m,
         util::scale(258),
         column,
-        util::scale(28),
+        util::scale(18),
     );
     move_window(
         c.clear_encryption_password,
         right,
         util::scale(258),
         column,
-        util::scale(28),
+        util::scale(18),
     );
     move_window(
         c.sync_on_change,
         m,
-        util::scale(266),
+        util::scale(278),
         inner,
-        util::scale(20),
+        util::scale(18),
     );
-    move_window(c.backup, m, util::scale(288), inner, util::scale(20));
+    move_window(c.backup, m, util::scale(298), inner, util::scale(18));
     move_window(
         c.certificate_fingerprint,
         m,
-        util::scale(312),
+        util::scale(320),
         inner,
-        util::scale(26),
+        util::scale(18),
     );
 }
 
@@ -2258,7 +2258,7 @@ fn paint_chrome(hwnd: HWND) {
             &brand,
             "Vibekey",
             theme::semibold_font(),
-            theme::TEXT_ON_DARK,
+            theme::TEXT,
             true,
         );
         let tagline = util::rect(
@@ -2272,7 +2272,7 @@ fn paint_chrome(hwnd: HWND) {
             &tagline,
             "输入，快人一步",
             theme::small_font(),
-            theme::rgb(157, 170, 198),
+            theme::TEXT_MUTED,
             true,
         );
         let footer = util::rect(
@@ -2289,7 +2289,7 @@ fn paint_chrome(hwnd: HWND) {
                 env!("CARGO_PKG_VERSION")
             ),
             theme::small_font(),
-            theme::rgb(157, 170, 198),
+            theme::TEXT_MUTED,
         );
         EndPaint(hwnd, &paint);
     }
@@ -2300,7 +2300,7 @@ unsafe fn draw_nav_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
     let active = selected_page == state.current_page;
     let pressed = item.itemState & ODS_SELECTED != 0;
     let background = if active {
-        theme::ACCENT
+        theme::ACCENT_SOFT
     } else if pressed {
         theme::SIDEBAR_HOVER
     } else {
@@ -2317,9 +2317,9 @@ unsafe fn draw_nav_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
         &text,
         theme::semibold_font(),
         if active {
-            theme::SURFACE
+            theme::TEXT
         } else {
-            theme::rgb(196, 205, 227)
+            theme::TEXT_MUTED
         },
         true,
     );
@@ -2330,7 +2330,7 @@ unsafe fn draw_nav_button(state: &SettingsState, item: &DRAWITEMSTRUCT) {
             item.rcItem.left + util::scale(3),
             item.rcItem.bottom - util::scale(10),
         );
-        theme::fill(item.hDC, &marker, theme::SURFACE);
+        theme::fill(item.hDC, &marker, theme::ACCENT);
     }
 }
 
