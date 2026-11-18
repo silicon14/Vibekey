@@ -352,10 +352,10 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 
 ## 10. 当前产物与提交状态（2026-11-06 交接时）
 
-- **源码与完整 git 历史在 `10.126.126.105`**（用户 zzq，`~/Vibekey`，6 个 commit，分支 master）。
+- **源码与完整 git 历史最初在开发机的局域网 git 服务上**（分支 master）。
   Windows 工作区是用 `git clone` 拉回来的副本。原先工作区里那份 `.git` 是坏的（index 有条目、object 库为空），
   已挪到 `C:\SAPrograms\vibekey-git-broken-20261106`。
-- 分支 master，无远程仓库（git remote 为空；接手后自行添加 origin）。
+- 分支 master；公开仓库为 GitHub `silicon14/Vibekey`（remote `github`），`origin` 仍指向局域网镜像。
 - 最近提交：修复两轮 QA 问题后的版本（见 git log）。
 - dist/（git 忽略）：
 
