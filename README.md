@@ -1,5 +1,7 @@
 # Vibekey
 
+[![build](https://github.com/silicon14/Vibekey/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/silicon14/Vibekey/actions/workflows/build.yml)
+
 按住 **Alt** 再按数字键，就能把预先配置好的文字直接输入到当前窗口 —— 常驻托盘、
 纯文本配置、支持 WebDAV 同步的 Windows 小工具。
 
@@ -51,6 +53,8 @@ Vibekey 是给“高频重复输入”准备的：自我介绍、邮箱、地址
 1. 从 Releases 下载对应目录/压缩包：
    - `vibekey-<version>-win7-x64/`：64 位（Windows 7 SP1 x64 / Windows 10/11 x64）
    - `vibekey-<version>-win7-win32/`：32 位（32 位 Windows 7/10/11，也可在 64 位系统上通过 WoW64 运行）
+   也可以从 GitHub Actions 的最新 `master` 构建里下载 `vibekey-win7` / `vibekey-windows-native`
+   构件（artifact，需要登录 GitHub）。
 2. 把 `vibekey.exe` 放到任意目录（建议不含空格和中文，例如 `C:\Tools\vibekey\`），双击运行。
 3. 托盘出现图标后即可使用；首次启动会在 `%APPDATA%\Vibekey\` 下生成 `config.toml` 和日志。
 4. 想开机自启：配置菜单 →「开机启动」，或双击托盘打开设置窗口勾选。

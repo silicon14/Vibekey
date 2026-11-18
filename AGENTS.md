@@ -65,7 +65,7 @@
     scripts/                   Linux 交叉编译/打包/校验脚本（bash）
     assets/config.example.toml 完整示例配置
     dist/                      生成物（git 忽略）：Win7 发布目录 + SHA256SUMS
-    .github/workflows/build.yml CI（尚未在真实 GitHub 上跑过）
+    .github/workflows/build.yml CI（已在 GitHub 跑通，三个 job 全绿）
 
 ### 关键文档
 
@@ -174,7 +174,7 @@ Win7 目标（x86_64-win7-windows-msvc / i686-win7-windows-msvc）是 tier-3，�
     cargo build -p vibekey            # Win10+ 本机
 
 Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/workflows/build.yml
-（包含 core-test / win7-cross / windows-native 三个 job，但尚未在真实 GitHub 上执行过）。
+（包含 core-test / win7-cross / windows-native 三个 job，2026-11-18 在真实 GitHub 上全部通过）。
 
 ### 4.2 真机验收（必做）
 
@@ -292,7 +292,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 - [ ] 菜单 owner 是隐藏窗口，极端前台锁场景下菜单可能需点击空白才消失（实测确认）
 - [ ] 代码签名 / SmartScreen 提示（需要证书，非代码问题）
 - [ ] WebDAV 只支持 Basic 认证；Digest/OAuth 未实现。内容加密不保护 Basic 头/元数据，不防旧密文回滚，仍需 HTTPS
-- [ ] CI 未在真实 GitHub 跑过；跑通后把 badge / artifact 用法补进 README
+- [x] CI 已在真实 GitHub 跑通（2026-11-18，core-test / win7-cross / windows-native 全绿），badge 已加入 README，构件可从 Actions 下载
 
 ### P2：可选增强
 
