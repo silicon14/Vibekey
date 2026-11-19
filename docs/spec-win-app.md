@@ -89,18 +89,21 @@ input_method、restore_clipboard。片段在工作线程展开；历史 expand_t
    检测到菜单才发送一次 Esc，再从实际发送时起最多 250ms 确认退出，避免 Explorer 的菜单尚未进入就提前放行 Ctrl+V。
    等待期间前台窗口变化必须取消本次输入，不得关闭其它窗口菜单或注入错误目标。不得无条件 Esc，以免取消地址栏编辑。
 5. paste 模式：
-   - 先用 EnumClipboardFormats 检查：纯文本才保存 CF_UNICODETEXT 并粘贴；文件/图片/富文本时不要覆盖剪贴板，
-     改为逐字符输入（实现：clipboard::inspect() → ClipboardContent::Rich 时回退 type 模式）。
+   - `clipboard::snapshot()` 完整复制当前剪贴板：EnumClipboardFormats 枚举后逐个保存。文本/PNG/DIB/DIBV5/HDROP/
+     HTML/RTF/OLE 数据等按 HGLOBAL 复制；CF_BITMAP 用 GetObjectW 估算大小并用 CopyImage 复制。
+     无法安全复制的格式（CF_METAFILEPICT、CF_PALETTE、CF_ENHMETAFILE、CF_OWNERDISPLAY、DSP/私有/GDI 格式）、
+     快照超过 128 MB 或打开剪贴板失败时返回错误，交给 type 模式并保持剪贴板不变。
    - OpenClipboard 重试 10 次、每次 10ms；EmptyClipboard；GlobalAlloc(GMEM_MOVEABLE) 写入 UTF-16（含结尾 0）；
      SetClipboardData(CF_UNICODETEXT)。
-   - Sleep 50ms 后 SendInput Ctrl+V（4 个事件：Ctrl down, V down, V up, Ctrl up，V 用 KEYEVENTF_UNICODE 不需要；
-     用虚拟键 VK_CONTROL/VK_V）。
+   - Sleep 50ms 后 SendInput Ctrl+V（4 个事件：Ctrl down, V down, V up, Ctrl up；用 VK_CONTROL/VK_V）。
    - 若 send_enter：Sleep 30ms 后发送 VK_RETURN 按下/抬起。
-   - 250ms 后恢复剪贴板文本（restore_clipboard 为 false 时跳过）。恢复必须在注入工作线程内串行执行，
-     避免主线程 TIMER 与后续注入任务竞争导致恢复成片段文本；原始剪贴板为空时恢复为空。
-   - 任何一步失败 → 回退到 type 模式。
-6. type 模式：对 UTF-16 code unit 逐个 SendInput(KEYEVENTF_UNICODE)，每 2ms 一个，每 200 个字符让出 5ms。
-   文本中的 \n 转换为 VK_RETURN 按下/抬起（KEYEVENTF_UNICODE 的 \n 在部分程序里无效）。
+   - 250ms 后 `ClipboardSnapshot::restore()` 重新 EmptyClipboard 并逐个 SetClipboardData 恢复全部格式
+     （restore_clipboard 为 false 时跳过快照与恢复）。恢复必须在注入工作线程内串行执行，避免主线程 TIMER
+     与后续注入任务竞争导致恢复成片段文本；原始剪贴板为空时恢复为空。
+   - Ctrl+V 或回车失败时也要恢复快照，不能让片段留在剪贴板；恢复失败只记日志，不把成功粘贴改为失败。
+   - 快照失败或任何一步失败 → 回退到 type 模式。
+6. type 模式：先累积 INPUT 事件，每 512 个事件调用一次 SendInput(KEYEVENTF_UNICODE)，块与块之间 yield，
+   不再逐字符 sleep；文本中的 \n 转换为 VK_RETURN 按下/抬起（KEYEVENTF_UNICODE 的 \n 在部分程序里无效）。
 7. 结果 PostMessage 主窗口 WM_APP_INJECT_DONE（wparam 0 成功 / 1 失败），失败原因写到 App 的 last_error。
 
 所有 SendInput 前都要确认物理 Ctrl/Shift/Win 没被按住（等待 100ms，超时则强发）。

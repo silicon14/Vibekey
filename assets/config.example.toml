@@ -16,11 +16,12 @@ hold_ms = 350
 
 # 文本注入方式：
 #   "paste"  写入剪贴板后发送 Ctrl+V（默认，中文/Unicode 最稳）
-#   "type"   用 SendInput 逐字符输入（适合不允许改动剪贴板的程序）
+#   "type"   用 SendInput 成批输入（适合不允许改动剪贴板的程序）
 input_method = "paste"
 
-# 粘贴后是否恢复剪贴板里原来的文本。只保存/恢复纯文本；检测到图片、文件
-# 或富文本时会自动改用逐字符输入，不覆盖原剪贴板。
+# 粘贴后是否恢复剪贴板里原来的内容。默认会先完整快照所有可恢复格式
+# （文本、图片、文件、HTML/RTF 等），粘贴后约 250ms 原样恢复；无法快照的
+# 特殊格式或超大内容才会回退到 SendInput，且不覆盖原剪贴板。
 restore_clipboard = true
 
 # 开机自动启动（写入 HKCU\Software\Microsoft\Windows\CurrentVersion\Run）。

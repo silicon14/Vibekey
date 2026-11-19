@@ -48,11 +48,13 @@ RegisterHotKey 注册的组合键会被系统独占，且无法感知 Alt 单独
 
 ### 3. 文字注入：默认剪贴板粘贴
 
-中文/Unicode 走剪贴板最稳：先检查剪贴板格式 → 纯文本时保存文本 → 写入片段 → 发送 Ctrl+V → 250ms 后在同一注入线程内恢复。
+中文/Unicode 走剪贴板最稳：先对剪贴板做完整快照 → 写入片段 → 发送 Ctrl+V → 250ms 后在同一注入线程内恢复全部格式。
+快照用 EnumClipboardFormats 枚举格式：文本、PNG、DIB/DIBV5、HDROP、HTML/RTF、OLE 数据等按 HGLOBAL 逐字节复制，
+CF_BITMAP 用 CopyImage 复制。这样剪贴板里是截图、文件或富文本时也能**一次性粘贴**，原内容不会丢。
 恢复放在注入线程内串行执行，避免连续触发时“把上一条片段当成原文恢复”的竞态。
-如果剪贴板里是文件/图片/富文本（EnumClipboardFormats 发现非纯文本格式），则**不覆盖剪贴板**，自动改用
-SendInput(KEYEVENTF_UNICODE) 逐字符输入；打不开剪贴板时同样保守回退到逐字符输入。
-可选 type 模式：适合不允许动剪贴板的场景。
+只有无法安全复制的格式（metafile、palette、owner-display、私有/GDI 格式）、快照超过 128 MB 或打不开剪贴板时，
+才回退到 SendInput(KEYEVENTF_UNICODE)；回退路径按块批量发送，不再逐字符 2ms 慢速输入。
+`restore_clipboard=false` 时跳过快照，片段会直接覆盖剪贴板。
 注入前必须等物理 Alt 松开（否则 Ctrl+V 会变成 Ctrl+Alt+V）。
 
 ### 4. 配置
@@ -195,7 +197,7 @@ Rust 1.78 起，普通 *-pc-windows-* 目标的 std 要求 Windows 10；官方�
 
 - 管理员权限窗口无法注入（UIPI），检测到后给出托盘提示。
 - 全局吞掉 Alt+数字，会和个别程序（部分游戏、IDE 快捷键）冲突；用 ignore_apps 或 hold 模式规避。
-- 剪贴板恢复只针对纯文本；检测到文件/图片/富文本时自动改用逐字符输入以保留原剪贴板（长文本会明显变慢）。
-  只有 restore_clipboard=false 才会主动覆盖剪贴板。
+- 剪贴板恢复依赖逐格式快照；metafile、owner-display、私有 GDI 格式和超过 128 MB 的内容会回退到批量 SendInput，
+  仍保留原剪贴板。只有 restore_clipboard=false 才会主动覆盖剪贴板。
 - WebDAV 只支持 Basic 认证；Digest/OAuth 需要后续补齐。
 - 配置冲突采用本地优先策略，远端改动会备份但不会自动合并。

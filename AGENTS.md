@@ -182,7 +182,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 
 1. 记事本 / 资源管理器 / Office 里 Alt+1：文字插入文档，**目标程序的菜单不会被激活**；
 2. Alt+反引号弹出列表后，**不点鼠标**直接方向键/Enter/Esc 可用；
-3. 复制一个文件/图片后触发片段：文字以逐字符输入插入，**剪贴板里的文件/图片不丢**；
+3. 复制一个文件/图片/富文本后触发片段：文字以剪贴板粘贴一次性插入，**剪贴板里的文件/图片/格式在约 250ms 后完整恢复**；
 4. 连续快速触发两个不同片段：插入文字正确，剪贴板最终恢复为用户原文；
 5. 设置里切 hold 模式：快速点按 Alt+1 不触发；按住 Alt 约 1 秒再按 1 才触发；
 6. 按住 Alt+1 不放：只插入一次，目标程序不 beep、不重复出字；
@@ -260,8 +260,10 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 - **自动重复**：CONSUMED_VK 记录被吞的键，其重复事件必须继续吞掉。
 - **前台激活**：普通 SetForegroundWindow 在用户刚按键时会被前台锁拒绝；弹窗/菜单用
   util::force_foreground()（AttachThreadInput 技巧）。
-- **剪贴板**：restore_clipboard=true 时先 clipboard::inspect()：纯文本才保存/恢复；文件/图片/富文本
-  自动改用 SendInput Unicode，不覆盖剪贴板。恢复在注入线程内串行执行（250ms 后）。
+- **剪贴板**：restore_clipboard=true 时先 `clipboard::snapshot()` 完整复制所有可恢复格式（文本/图片/文件/
+  HTML/RTF；CF_BITMAP 用 CopyImage，其余按 HGLOBAL）；粘贴后 250ms 在注入线程内串行恢复全部格式。
+  无法安全复制的特殊格式（metafile/palette/owner-display/私有 GDI）、超过 128 MB 或打开失败时才回退
+  SendInput；回退路径按块批量发送，不再逐字符 sleep。Ctrl+V/回车失败也要恢复快照。
 - **同步**：内容 hash + ETag 判定；本地优先，远端冲突备份为 <url>.remote-backup-<时间戳>.toml；
   首次同步（无状态）且远端有文件时以远端为准；远端配置解析失败拒绝覆盖本地。
 - **退出**：同步线程 busy 时最多等 2s 后 detach，避免关机卡死。
@@ -288,7 +290,7 @@ Win7 发布前再跑 3.2 的两个 target 构建 + PE 校验。CI 见 .github/wo
 - [ ] App 严格别名 caveat（app.rs 顶部注释）：彻底修需要内部可变性 + 重入队列重构
 - [x] 设置窗口已加入“清除已保存密码”（2026-11-09；点击后仅在应用时清除，取消不影响原密码）
 - [ ] UIPI 查询失败（返回 None）时按不可确认处理；可优化提示
-- [ ] 非文本剪贴板时改逐字输入，长文本较慢；如需更快可考虑 OLE IDataObject 完整快照（复杂，谨慎）
+- [x] 非文本剪贴板改为完整快照/恢复（2026-11-19：raw HGLOBAL + CopyImage，已用截图 DIB + 自定义格式做端到端验证）；metafile/owner-display 等特殊格式仍回退批量 SendInput，可选再做 OLE IDataObject 快照
 - [ ] 菜单 owner 是隐藏窗口，极端前台锁场景下菜单可能需点击空白才消失（实测确认）
 - [ ] 代码签名 / SmartScreen 提示（需要证书，非代码问题）
 - [ ] WebDAV 只支持 Basic 认证；Digest/OAuth 未实现。内容加密不保护 Basic 头/元数据，不防旧密文回滚，仍需 HTTPS

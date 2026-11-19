@@ -608,10 +608,7 @@ unsafe fn create_behavior_controls(state: &mut SettingsState) {
     c.input_method = combo(
         page,
         ID_INPUT_METHOD,
-        &[
-            "剪贴板粘贴（推荐，中文最稳）",
-            "直接输入（SendInput Unicode）",
-        ],
+        &["剪贴板粘贴（推荐，中文最稳）", "直接输入（SendInput 批量）"],
         match config.input_method {
             InputMethod::Paste => 0,
             InputMethod::Type => 1,
@@ -619,7 +616,7 @@ unsafe fn create_behavior_controls(state: &mut SettingsState) {
     );
     c.restore_clipboard = checkbox(
         page,
-        "输入后恢复纯文本剪贴板",
+        "输入后恢复剪贴板原内容",
         config.restore_clipboard,
         ID_RESTORE_CLIPBOARD,
     );

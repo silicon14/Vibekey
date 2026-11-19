@@ -1,11 +1,13 @@
-//! Clipboard text helpers.
+//! Clipboard helpers.
 //!
-//! Only CF_UNICODETEXT is read and written: the clipboard is opened with retries
-//! because another application may hold it for a few milliseconds. The existing
-//! formats are inspected first so that richer clipboard content (files, images,
-//! HTML, RTF) is never destroyed by a paste.
+//! Text is read and written as CF_UNICODETEXT. The clipboard is opened with
+//! retries because another application may hold it for a few milliseconds.
+//! Before a paste the whole format list is snapshotted, so rich content (files,
+//! images, HTML, RTF, OLE objects) can be restored afterwards instead of being
+//! destroyed.
 
 use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+use windows_sys::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP, HBITMAP, HGDIOBJ};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
     GetClipboardSequenceNumber, OpenClipboard, SetClipboardData,
@@ -13,18 +15,32 @@ use windows_sys::Win32::System::DataExchange::{
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{CopyImage, IMAGE_BITMAP};
 
 /// CF_UNICODETEXT; defined here because the windows-sys module that owns the
 /// clipboard format constants (Win32_System_Ole) is not enabled.
 pub const CF_UNICODETEXT: u32 = 13;
-/// Clipboard formats that only carry plain text and may be replaced by a paste.
-const CF_TEXT: u32 = 1;
-const CF_OEMTEXT: u32 = 7;
-/// Language information that accompanies a text clipboard entry.
-const CF_LOCALE: u32 = 16;
+const CF_BITMAP: u32 = 2;
+const CF_METAFILEPICT: u32 = 3;
+const CF_PALETTE: u32 = 9;
+const CF_ENHMETAFILE: u32 = 14;
+const CF_OWNERDISPLAY: u32 = 0x0080;
+const CF_DSPBITMAP: u32 = 0x0082;
+const CF_DSPMETAFILEPICT: u32 = 0x0083;
+const CF_DSPENHMETAFILE: u32 = 0x008E;
+const CF_PRIVATEFIRST: u32 = 0x0200;
+const CF_PRIVATELAST: u32 = 0x02FF;
+const CF_GDIOBJFIRST: u32 = 0x0300;
+const CF_GDIOBJLAST: u32 = 0x03FF;
 
 const OPEN_RETRIES: u32 = 10;
 const OPEN_RETRY_DELAY_MS: u64 = 10;
+/// Upper bound for one clipboard snapshot. Pasting must not allocate unbounded
+/// memory just because the clipboard holds a very large payload; bigger data
+/// falls back to the (fast) SendInput path and leaves the clipboard alone.
+const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
+/// A defensive cap for erratic clipboard owners.
+const MAX_CLIPBOARD_FORMATS: usize = 256;
 
 /// Open the clipboard, retrying a few times when another application owns it.
 fn open_clipboard(owner: HWND) -> bool {
@@ -37,60 +53,6 @@ fn open_clipboard(owner: HWND) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(OPEN_RETRY_DELAY_MS));
     }
     false
-}
-
-/// What the clipboard currently holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClipboardContent {
-    /// No formats at all.
-    Empty,
-    /// Only plain text formats; the text, when the owner provided one.
-    Text(Option<String>),
-    /// Files, images, HTML, RTF or any other non plain text format.
-    Rich,
-}
-
-/// Inspect the clipboard in one open/close cycle.
-///
-/// Returns None when the clipboard could not be opened, so callers can decide
-/// whether it is safe to continue (a paste needs the save/restore information).
-pub fn inspect() -> Option<ClipboardContent> {
-    if !open_clipboard(std::ptr::null_mut()) {
-        return None;
-    }
-    let mut formats = Vec::new();
-    // SAFETY: the clipboard is open; EnumClipboardFormats is called with the
-    // previous format (0 to start) until it returns 0. The clipboard is closed
-    // exactly once below.
-    unsafe {
-        let mut format = 0u32;
-        loop {
-            format = EnumClipboardFormats(format);
-            if format == 0 {
-                break;
-            }
-            formats.push(format);
-            if formats.len() > 256 {
-                break;
-            }
-        }
-        let rich = formats
-            .iter()
-            .any(|format| !matches!(*format, CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT | CF_LOCALE));
-        let text = if rich || formats.is_empty() {
-            None
-        } else {
-            read_text_locked()
-        };
-        CloseClipboard();
-        if rich {
-            Some(ClipboardContent::Rich)
-        } else if formats.is_empty() {
-            Some(ClipboardContent::Empty)
-        } else {
-            Some(ClipboardContent::Text(text))
-        }
-    }
 }
 
 /// Read CF_UNICODETEXT while the clipboard is already open.
@@ -176,24 +138,6 @@ fn owned_sequence() -> Option<u32> {
     (sequence != 0).then_some(sequence)
 }
 
-/// Empty the clipboard again, used to restore the "no clipboard content" state.
-pub fn clear() -> ClipboardMutation {
-    if !open_clipboard(std::ptr::null_mut()) {
-        return ClipboardMutation::failed();
-    }
-    // SAFETY: the clipboard is open and is closed exactly once below. Sequence
-    // attribution happens before CloseClipboard while ownership is exclusive.
-    unsafe {
-        let mut outcome = ClipboardMutation::failed();
-        if EmptyClipboard() != 0 {
-            outcome.succeeded = true;
-            outcome.sequence = owned_sequence();
-        }
-        CloseClipboard();
-        outcome
-    }
-}
-
 /// Replace the clipboard text. A failed write can still have emptied the old
 /// clipboard; the returned sequence records that mutation as well.
 pub fn write_text(text: &str) -> ClipboardMutation {
@@ -234,4 +178,256 @@ pub fn write_text(text: &str) -> ClipboardMutation {
         CloseClipboard();
     }
     outcome
+}
+
+/// Clipboard formats that cannot be duplicated for a later restore.
+///
+/// They either contain GDI/owner-rendered handles whose lifetime cannot be
+/// copied safely, or private formats with unknown ownership semantics. Keeping
+/// the old behaviour (SendInput) is safer than restoring a broken clipboard.
+fn unsupported_format(format: u32) -> bool {
+    matches!(
+        format,
+        CF_METAFILEPICT
+            | CF_PALETTE
+            | CF_ENHMETAFILE
+            | CF_OWNERDISPLAY
+            | CF_DSPBITMAP
+            | CF_DSPMETAFILEPICT
+            | CF_DSPENHMETAFILE
+    ) || (CF_PRIVATEFIRST..=CF_PRIVATELAST).contains(&format)
+        || (CF_GDIOBJFIRST..=CF_GDIOBJLAST).contains(&format)
+}
+
+/// One duplicated clipboard payload.
+enum SavedData {
+    Bytes(Vec<u8>),
+    Bitmap(HBITMAP),
+}
+
+struct SavedFormat {
+    format: u32,
+    data: SavedData,
+}
+
+impl Drop for SavedFormat {
+    fn drop(&mut self) {
+        if let SavedData::Bitmap(handle) = &mut self.data {
+            let bitmap = std::mem::replace(handle, std::ptr::null_mut());
+            if !bitmap.is_null() {
+                // SAFETY: the handle was created by CopyImage in snapshot() and
+                // is owned by this snapshot until it is given to the clipboard.
+                unsafe {
+                    DeleteObject(bitmap as HGDIOBJ);
+                }
+            }
+        }
+    }
+}
+
+/// A complete copy of the clipboard formats taken before a paste.
+///
+/// Rich content (files, images, HTML/RTF, OLE objects, ...) is duplicated into
+/// private memory so that the snippet can still be pasted with Ctrl+V and the
+/// original clipboard can be put back afterwards. Formats that cannot be
+/// duplicated safely make `snapshot()` fail; the caller then uses SendInput and
+/// leaves the clipboard untouched.
+pub struct ClipboardSnapshot {
+    formats: Vec<SavedFormat>,
+}
+
+impl ClipboardSnapshot {
+    /// Put every saved format back on the clipboard, replacing whatever the
+    /// paste left there. Returns the usually filtered internal mutation record.
+    pub fn restore(&mut self) -> ClipboardMutation {
+        if !open_clipboard(std::ptr::null_mut()) {
+            return ClipboardMutation::failed();
+        }
+        let mut outcome = ClipboardMutation::failed();
+        // SAFETY: every block allocated below is either handed to the clipboard
+        // or freed on the same path. The clipboard is closed exactly once, after
+        // the sequence number is read while ownership is still exclusive.
+        unsafe {
+            if EmptyClipboard() != 0 {
+                outcome.sequence = owned_sequence();
+                for saved in &mut self.formats {
+                    match &mut saved.data {
+                        SavedData::Bytes(bytes) => {
+                            let size = bytes.len().max(1);
+                            let memory = GlobalAlloc(GMEM_MOVEABLE, size);
+                            if memory.is_null() {
+                                continue;
+                            }
+                            let pointer = GlobalLock(memory);
+                            if pointer.is_null() {
+                                GlobalFree(memory);
+                                continue;
+                            }
+                            if bytes.is_empty() {
+                                *(pointer as *mut u8) = 0;
+                            } else {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr(),
+                                    pointer as *mut u8,
+                                    bytes.len(),
+                                );
+                            }
+                            GlobalUnlock(memory);
+                            if SetClipboardData(saved.format, memory as HANDLE).is_null() {
+                                GlobalFree(memory);
+                            } else {
+                                outcome.succeeded = true;
+                            }
+                        }
+                        SavedData::Bitmap(handle) => {
+                            let bitmap = std::mem::replace(handle, std::ptr::null_mut());
+                            if bitmap.is_null() {
+                                continue;
+                            }
+                            if SetClipboardData(CF_BITMAP, bitmap as HANDLE).is_null() {
+                                DeleteObject(bitmap as HGDIOBJ);
+                            } else {
+                                outcome.succeeded = true;
+                            }
+                        }
+                    }
+                }
+                if self.formats.is_empty() {
+                    outcome.succeeded = true;
+                }
+                outcome.sequence = owned_sequence();
+            }
+            CloseClipboard();
+        }
+        outcome
+    }
+}
+
+/// Duplicate one clipboard format while the clipboard is open.
+///
+/// SAFETY: the clipboard must be open on the calling thread; `format` must have
+/// been returned by EnumClipboardFormats in the same open/close cycle.
+unsafe fn save_format(format: u32) -> Result<(SavedData, usize), String> {
+    let handle = GetClipboardData(format);
+    if handle.is_null() {
+        return Err(format!(
+            "无法读取剪贴板格式 {format}，改为直接输入以保留原剪贴板"
+        ));
+    }
+    if format == CF_BITMAP {
+        let mut bitmap: BITMAP = std::mem::zeroed();
+        let described = GetObjectW(
+            handle,
+            std::mem::size_of::<BITMAP>() as i32,
+            &mut bitmap as *mut BITMAP as *mut core::ffi::c_void,
+        );
+        let size = if described != 0 {
+            (bitmap.bmWidth as u64)
+                .saturating_mul(bitmap.bmHeight as u64)
+                .saturating_mul(bitmap.bmBitsPixel as u64)
+                .saturating_div(8)
+        } else {
+            0
+        };
+        if size > MAX_SNAPSHOT_BYTES as u64 {
+            return Err("剪贴板图片过大，改为直接输入以保留原剪贴板".to_string());
+        }
+        let size = size as usize;
+        let copy = CopyImage(handle, IMAGE_BITMAP, 0, 0, 0);
+        if copy.is_null() {
+            return Err("无法复制剪贴板图片，改为直接输入以保留原剪贴板".to_string());
+        }
+        return Ok((SavedData::Bitmap(copy as HBITMAP), size));
+    }
+
+    let size = GlobalSize(handle as HANDLE);
+    if size > MAX_SNAPSHOT_BYTES {
+        return Err("剪贴板内容过大，改为直接输入以保留原剪贴板".to_string());
+    }
+    let pointer = GlobalLock(handle as HANDLE);
+    if pointer.is_null() {
+        return Err(format!(
+            "无法读取剪贴板格式 {format}，改为直接输入以保留原剪贴板"
+        ));
+    }
+    let mut bytes = vec![0u8; size];
+    if size > 0 {
+        std::ptr::copy_nonoverlapping(pointer as *const u8, bytes.as_mut_ptr(), size);
+    }
+    GlobalUnlock(handle as HANDLE);
+    Ok((SavedData::Bytes(bytes), size))
+}
+
+/// Take a full copy of the current clipboard.
+///
+/// The clipboard is opened once, so its format list cannot change between the
+/// formats that are duplicated.
+pub fn snapshot() -> Result<ClipboardSnapshot, String> {
+    if !open_clipboard(std::ptr::null_mut()) {
+        return Err("无法读取剪贴板内容，改为直接输入以保留原剪贴板".to_string());
+    }
+    let mut formats = Vec::new();
+    // SAFETY: the clipboard is open; EnumClipboardFormats is called with the
+    // previous format (0 to start) until it returns 0.
+    unsafe {
+        let mut format = 0u32;
+        loop {
+            format = EnumClipboardFormats(format);
+            if format == 0 {
+                break;
+            }
+            formats.push(format);
+            if formats.len() > MAX_CLIPBOARD_FORMATS {
+                break;
+            }
+        }
+    }
+    if formats.len() > MAX_CLIPBOARD_FORMATS {
+        // SAFETY: the clipboard was opened above and is closed exactly once.
+        unsafe {
+            CloseClipboard();
+        }
+        return Err("剪贴板包含过多格式，改为直接输入以保留原剪贴板".to_string());
+    }
+    let mut saved = Vec::with_capacity(formats.len());
+    let mut total = 0usize;
+    for format in formats {
+        if unsupported_format(format) {
+            // SAFETY: the clipboard was opened above and is closed exactly once.
+            unsafe {
+                CloseClipboard();
+            }
+            return Err(format!(
+                "剪贴板格式 {format} 无法安全恢复，改为直接输入以保留原剪贴板"
+            ));
+        }
+        // SAFETY: the clipboard is open and format was enumerated above.
+        match unsafe { save_format(format) } {
+            Ok((data, size)) => {
+                total = total.saturating_add(size);
+                if total > MAX_SNAPSHOT_BYTES {
+                    // SAFETY: the clipboard was opened above; saved formats free
+                    // their own GDI handles when the vector is dropped.
+                    unsafe {
+                        CloseClipboard();
+                    }
+                    return Err("剪贴板内容过大，改为直接输入以保留原剪贴板".to_string());
+                }
+                saved.push(SavedFormat { format, data });
+            }
+            Err(error) => {
+                // SAFETY: the clipboard was opened above and is closed exactly
+                // once before returning.
+                unsafe {
+                    CloseClipboard();
+                }
+                return Err(error);
+            }
+        }
+    }
+    // SAFETY: the clipboard was opened above and is closed exactly once.
+    unsafe {
+        CloseClipboard();
+    }
+    Ok(ClipboardSnapshot { formats: saved })
 }

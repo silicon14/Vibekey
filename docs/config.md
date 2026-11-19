@@ -48,8 +48,8 @@ Windows 上配置文件位于应用数据目录：
 | --- | --- | --- | --- |
 | `activation` | 字符串枚举 | `immediate` | 触发方式。`immediate`：按住 Alt 后按数字键立即触发；`hold`：Alt 必须先按住 `hold_ms` 毫秒，再按数字键才触发，用于减少误触。 |
 | `hold_ms` | 整数 | `350` | `hold` 模式下 Alt 需要按住的毫秒数。建议范围 100–3000，超出只是警告。 |
-| `input_method` | 字符串枚举 | `paste` | 文字注入方式。`paste`：写入剪贴板后发送 Ctrl+V（默认，中文/Unicode 最稳）；`type`：用 SendInput 逐字符输入，适合不允许改动剪贴板的程序。 |
-| `restore_clipboard` | 布尔 | `true` | 粘贴后是否恢复剪贴板原有内容。为 `true` 时：纯文本会完整恢复；剪贴板里是文件/图片/富文本（HTML/RTF 等）时程序**不覆盖剪贴板**，自动改用逐字符输入。为 `false` 时直接用剪贴板粘贴，原内容会被片段覆盖。 |
+| `input_method` | 字符串枚举 | `paste` | 文字注入方式。`paste`：写入剪贴板后发送 Ctrl+V（默认，中文/Unicode 最稳）；`type`：用 SendInput 成批输入，适合不允许改动剪贴板的程序。`type` 模式也会在粘贴失败时作为回退路径。 |
+| `restore_clipboard` | 布尔 | `true` | 粘贴后是否恢复剪贴板原有内容。为 `true` 时：粘贴前完整快照所有可复制的剪贴板格式（文本、图片、文件、HTML/RTF 等），粘贴后 250ms 原样恢复，因此剪贴板里有截图/文件也能一次性粘贴。无法安全复制的特殊格式（metafile、owner-display、私有 GDI 格式）或超过 128 MB 时，才回退到批量 SendInput 并保留原剪贴板。为 `false` 时直接用剪贴板粘贴且不恢复，原内容会被片段覆盖。 |
 | `start_with_windows` | 布尔 | `false` | 开机自启动。实际写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，托盘菜单「开机启动」会同步这个字段。 |
 | `ignore_apps` | 字符串数组 | `[]` | 在这些程序里不触发任何快捷键，按前台进程的 exe 文件名匹配，不区分大小写，例如 `["photoshop.exe"]`。空字符串条目会触发警告。 |
 | `[hotkeys]` | 表 | 见下 | 片段列表、剪贴板历史和配置菜单的快捷键。 |

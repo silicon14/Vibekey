@@ -503,67 +503,68 @@ fn press_control_v() -> bool {
 }
 
 /// Clipboard based delivery: copy, Ctrl+V, optional Enter and, when requested,
-/// restore the previous clipboard text again from this thread.
+/// restore the previous clipboard content again from this thread.
 ///
-/// The restore is serialised inside the worker: the next job only starts after
-/// the previous one has restored the original clipboard text, so a second snippet
-/// never saves the text of the first snippet as "the original".
+/// The whole clipboard is snapshotted before the paste, so files, images,
+/// HTML/RTF and other rich payloads survive the snippet. The restore is
+/// serialised inside the worker: the next job only starts after the previous one
+/// has restored the original clipboard, so a second snippet never saves the text
+/// of the first snippet as "the original".
 fn paste(history_control: &HistoryControl, job: &InjectJob, text: &str) -> Result<(), String> {
-    // Inspect the clipboard once, before changing it: plain text can be restored
-    // byte for byte, everything else (files, images, HTML, RTF) must be left
-    // alone, in which case the worker types the snippet instead.
-    let mut saved_text: Option<String> = None;
-    if job.restore_clipboard {
-        match clipboard::inspect() {
-            Some(clipboard::ClipboardContent::Rich) => {
-                log::info!("clipboard holds non text data; typing the snippet instead of pasting");
-                return Err("剪贴板包含非文本内容，改为直接输入以保留原剪贴板".to_string());
+    let mut snapshot = if job.restore_clipboard {
+        match clipboard::snapshot() {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                log::warn!(
+                    "could not snapshot the clipboard ({error}); typing the snippet instead"
+                );
+                return Err(error);
             }
-            Some(clipboard::ClipboardContent::Text(text)) => saved_text = text,
-            Some(clipboard::ClipboardContent::Empty) => saved_text = None,
-            None => {
-                // Without knowing what the clipboard holds, overwriting it could
-                // destroy data that cannot be restored.
-                log::warn!("could not inspect the clipboard; typing the snippet instead");
-                return Err("无法读取剪贴板内容，改为直接输入以保留原剪贴板".to_string());
-            }
+        }
+    } else {
+        None
+    };
+
+    if !history_control.internal_write(|| clipboard::write_text(text)) {
+        // write_text may have emptied the clipboard before failing.
+        if let Some(mut snapshot) = snapshot.take() {
+            let _ = history_control.internal_write(|| snapshot.restore());
+        }
+        return Err("无法写入剪贴板".to_string());
+    }
+
+    std::thread::sleep(Duration::from_millis(50));
+    let mut result = if press_control_v() {
+        Ok(())
+    } else {
+        Err("SendInput 发送 Ctrl+V 失败（目标窗口可能以管理员权限运行）".to_string())
+    };
+    if result.is_ok() && job.send_enter {
+        std::thread::sleep(Duration::from_millis(30));
+        if !tap(VK_RETURN) {
+            result = Err("SendInput 发送回车失败（目标窗口可能以管理员权限运行）".to_string());
         }
     }
 
-    if !history_control.internal_write(|| clipboard::write_text(text)) {
-        return Err("无法写入剪贴板".to_string());
-    }
-    std::thread::sleep(Duration::from_millis(50));
-    if !press_control_v() {
-        return Err("SendInput 发送 Ctrl+V 失败（目标窗口可能以管理员权限运行）".to_string());
-    }
-    if job.send_enter {
-        std::thread::sleep(Duration::from_millis(30));
-        if !tap(VK_RETURN) {
-            return Err("SendInput 发送回车失败（目标窗口可能以管理员权限运行）".to_string());
-        }
-    }
-    if job.restore_clipboard {
-        // Give slow target applications time to read the clipboard before it is
-        // rewritten.
+    if let Some(mut snapshot) = snapshot {
+        // Restore even when Ctrl+V failed: the clipboard must not be left with
+        // the snippet. The 250 ms delay gives slow target applications time to
+        // read the clipboard before it is rewritten.
         std::thread::sleep(CLIPBOARD_RESTORE_DELAY);
-        let restored = history_control.internal_write(|| match saved_text.as_deref() {
-            Some(saved) => clipboard::write_text(saved),
-            // The clipboard was empty before the paste; restore that state.
-            None => clipboard::clear(),
-        });
-        if !restored {
-            // A failed restore must not turn a successful injection into an
-            // error; it is only reported in the log.
+        if !history_control.internal_write(|| snapshot.restore()) {
             log::warn!("could not restore the previous clipboard content");
         }
     }
-    Ok(())
+    result
 }
 
 /// SendInput(KEYEVENTF_UNICODE) based delivery.
 fn type_text(shutdown: &AtomicBool, job: &InjectJob, text: &str) -> Result<(), String> {
-    let mut count = 0usize;
+    // Batch the events instead of sleeping after every character: a short
+    // snippet should appear at once even in this fallback path, and long text
+    // still yields between chunks so the target thread can process its queue.
+    const CHUNK_EVENTS: usize = 512;
+    let mut events: Vec<INPUT> = Vec::with_capacity(CHUNK_EVENTS);
     for character in text.chars() {
         if shutdown.load(Ordering::Acquire) {
             return Err("正在退出".to_string());
@@ -572,27 +573,23 @@ fn type_text(shutdown: &AtomicBool, job: &InjectJob, text: &str) -> Result<(), S
             continue;
         }
         if character == '\n' {
-            if !tap(VK_RETURN) {
-                return Err("SendInput 发送回车失败（目标窗口可能以管理员权限运行）".to_string());
-            }
+            events.push(key_event(VK_RETURN, 0));
+            events.push(key_event(VK_RETURN, KEYEVENTF_KEYUP));
         } else {
             let mut buffer = [0u16; 2];
             for unit in character.encode_utf16(&mut buffer) {
-                if !send(&[
-                    unicode_event(*unit, 0),
-                    unicode_event(*unit, KEYEVENTF_KEYUP),
-                ]) {
-                    return Err(
-                        "SendInput 输入字符失败（目标窗口可能以管理员权限运行）".to_string()
-                    );
-                }
+                events.push(unicode_event(*unit, 0));
+                events.push(unicode_event(*unit, KEYEVENTF_KEYUP));
             }
         }
-        count += 1;
-        std::thread::sleep(Duration::from_millis(2));
-        if count % 200 == 0 {
-            std::thread::sleep(Duration::from_millis(5));
+        if events.len() >= CHUNK_EVENTS {
+            if !flush_events(&mut events) {
+                return Err("SendInput 输入字符失败（目标窗口可能以管理员权限运行）".to_string());
+            }
         }
+    }
+    if !flush_events(&mut events) {
+        return Err("SendInput 输入字符失败（目标窗口可能以管理员权限运行）".to_string());
     }
     if job.send_enter {
         std::thread::sleep(Duration::from_millis(30));
@@ -601,4 +598,16 @@ fn type_text(shutdown: &AtomicBool, job: &InjectJob, text: &str) -> Result<(), S
         }
     }
     Ok(())
+}
+
+fn flush_events(events: &mut Vec<INPUT>) -> bool {
+    if events.is_empty() {
+        return true;
+    }
+    let sent = send(events);
+    events.clear();
+    // Give the target thread a chance to drain its input queue before the next
+    // chunk is appended.
+    std::thread::yield_now();
+    sent
 }
